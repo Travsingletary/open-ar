@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-ar"
+version = "0.1.0"
+description = "Open-source A&R: data-backed song briefs and release strategy, not vibes."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Open A&R contributors" }]
+keywords = ["music", "A&R", "audio-analysis", "release-strategy"]
+dependencies = [
+  "librosa>=0.10",
+  "soundfile>=0.12",
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "typer>=0.12",
+  "pydantic>=2.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+open-ar = "open_ar.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+open_ar = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
