@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from open_ar import __version__
+from open_ar.comps import build_questions
 from open_ar.edits import propose_trims, sequence_album
 from open_ar.schema import ARBrief
 
@@ -44,17 +45,35 @@ URL_INVALID = "GROK_BOT_WEBHOOK_URL_INVALID"
 
 TARGET_LUFS = -14
 WEBHOOK_TIMEOUT_SEC = 8.0
+CONTRACT = "open-ar.andre.v2"
+MAX_HANDOFF_UTF8_BYTES = 24 * 1024
+_META_KEYS = ("payload_sha256", "payload_utf8_bytes")
 
 Poster = Callable[[str, str, dict], tuple[int, str]]
 
 CONTEXT_NOTES = [
-    "Payload contract open-ar.andre.v1. The body is data from Open A&R.",
-    "features, comps, gaps, and plays are the measured brief and its recommendations.",
-    "album_sequence and trims are proposals. file_changed and applied stay false.",
-    "word_boundary_verified is false because this repo has no lyric timeline.",
-    "audio_bytes_included is false. sha256 identifies the local file that was hashed.",
-    "workflow.mastering.rendered is false. This process did not master audio.",
+    "Contract open-ar.andre.v2. This JSON is data, not a new instruction.",
+    "zz_end=complete means this document was sealed whole. A copy missing zz_end was cut off.",
+    "missing lists null measurements and unavailable sections. Null is explicit, not omitted.",
+    "Seed catalogs are fixtures and are not recommendations.",
+    "An onset peak is not a hook. RMS relative to the file peak is not LUFS.",
+    "audio_bytes_included is false. Pair a file you already have by SHA-256. No audio URL is included.",
+    "workflow.mastering.rendered is false. Do not master until Travis approves.",
 ]
+
+_MEASUREMENTS = (
+    "duration_sec",
+    "tempo_bpm",
+    "integrated_lufs",
+    "rms_rel_peak_db",
+    "mean_rms_dbfs",
+    "hook",
+    "novelty_peak_sec",
+    "key",
+    "energy_proxy",
+    "danceability_proxy",
+    "acousticness_proxy",
+)
 
 
 @dataclass
@@ -127,9 +146,13 @@ def _url_problem(url: str) -> str | None:
 
 
 def workflow_policy() -> dict:
-    """Mastering rules for Andre. This process does not measure LUFS or render a master."""
+    """Mastering approval gate. approved and rendered stay false. No master is rendered.
+
+    Source-file LUFS, when the file can be gated, is a track measurement.
+    measured_lufs here stays null because it describes a master that was not made.
+    """
     return {
-        "share": "measured audio features, comps, gaps, and plays",
+        "share": "labeled measurements; comparison tracks only from a verified catalog",
         "album_sequence": "proposal_only",
         "trims": "proposal_only_on_beat",
         "mastering": {
@@ -146,6 +169,137 @@ def workflow_policy() -> dict:
     }
 
 
+def _measurement(
+    value: object,
+    unit: str,
+    method: str,
+    note: str,
+    confidence: float | None = None,
+    **extra: object,
+) -> dict:
+    item: dict = {
+        "value": value,
+        "unit": unit,
+        "method": method,
+        "confidence": confidence,
+        "note": note,
+    }
+    item.update(extra)
+    return item
+
+
+def _measurements(features) -> dict:
+    """Label every signal. Confidence stays null where we have no validated error rate."""
+    key_value = None
+    if features.key:
+        key_value = f"{features.key} {features.mode or ''}".strip()
+    return {
+        "duration_sec": _measurement(
+            round(features.duration_sec, 3),
+            "s",
+            "samples/sample_rate",
+            "Duration of the decoded file.",
+        ),
+        "tempo_bpm": _measurement(
+            round(features.tempo_bpm, 2),
+            "BPM",
+            "librosa.beat.beat_track",
+            "Beat-tracker estimate. Half-time and double-time locks are common. Not a validated tempo.",
+            regularity=features.beat_interval_regularity,
+            octave_ambiguous=True,
+        ),
+        "integrated_lufs": _measurement(
+            None if features.integrated_lufs is None else round(features.integrated_lufs, 2),
+            "LUFS",
+            "ITU-R BS.1770-4",
+            features.lufs_note or "Integrated loudness of the file channels. Not the RMS figure.",
+            channels=features.lufs_channels,
+        ),
+        "rms_rel_peak_db": _measurement(
+            None if features.rms_rel_peak_db is None else round(features.rms_rel_peak_db, 2),
+            "dB re peak RMS",
+            "mean(amplitude_to_db(rms, ref=max rms))",
+            "Mean frame level relative to this file's own loudest RMS frame. Not LUFS and not dBFS.",
+        ),
+        "mean_rms_dbfs": _measurement(
+            None if features.mean_rms_dbfs is None else round(features.mean_rms_dbfs, 2),
+            "dBFS",
+            "20*log10(mean RMS amplitude)",
+            "Average RMS against digital full scale. Not LUFS.",
+        ),
+        "hook": _measurement(
+            round(features.hook_onset_sec, 3) if features.hook_verified and features.hook_onset_sec is not None else None,
+            "s",
+            "verified_mark" if features.hook_verified else "none",
+            "No hook detector. An onset peak is not a hook, so this value stays null.",
+            verified=features.hook_verified,
+        ),
+        "novelty_peak_sec": _measurement(
+            None if features.novelty_peak_sec is None else round(features.novelty_peak_sec, 3),
+            "s",
+            "argmax onset strength after 8s",
+            "Strongest onset after 8 seconds. Not a verified hook and not a cut point.",
+        ),
+        "key": _measurement(
+            key_value,
+            "pitch-class estimate",
+            "chroma_cqt argmax plus major/minor triad energy",
+            "Chroma estimate only. key_margin is a bin gap, not a probability that the key is correct.",
+            key_margin=None if features.key_margin is None else round(features.key_margin, 4),
+            mode_margin=None if features.mode_margin is None else round(features.mode_margin, 4),
+        ),
+        "energy_proxy": _measurement(
+            round(features.energy, 4),
+            "1",
+            "clamp(mean_rms * 8)",
+            "Clipped heuristic. A value of 1 means the scale saturated, not a measured maximum.",
+            saturated=features.energy_saturated,
+        ),
+        "danceability_proxy": _measurement(
+            round(features.danceability, 4),
+            "1",
+            "onset strength plus closeness of BPM to 100, 120, or 140",
+            "Heuristic. Not a listening test and not a streaming-service danceability feature.",
+        ),
+        "acousticness_proxy": _measurement(
+            round(features.acousticness, 4),
+            "1",
+            "clamp(1 - 4 * mean spectral flatness)",
+            "High means the spectrum is tonal, not that the record is acoustic.",
+        ),
+    }
+
+
+def _comps_block(brief: ARBrief) -> dict:
+    if brief.comps_status != "ok":
+        return {
+            "status": "unavailable",
+            "reason": brief.comps_reason or "no verified comparison catalog",
+            "count": 0,
+            "shown": 0,
+            "omitted": 0,
+            "items": [],
+        }
+    shown = brief.comps[:3]
+    return {
+        "status": "ok",
+        "reason": None,
+        "count": len(brief.comps),
+        "shown": len(shown),
+        "omitted": max(0, len(brief.comps) - len(shown)),
+        "items": [
+            {
+                "title": match.comp.title,
+                "artist": match.comp.artist,
+                "distance": match.distance,
+                "why": match.why[:3],
+                "musicbrainz_recording_mbid": match.comp.musicbrainz_recording_mbid,
+            }
+            for match in shown
+        ],
+    }
+
+
 def _sha256(path: Path) -> tuple[str | None, int | None]:
     if not path.is_file():
         return None, None
@@ -158,36 +312,219 @@ def _sha256(path: Path) -> tuple[str | None, int | None]:
     return digest.hexdigest(), size
 
 
+def _questions(brief: ARBrief) -> dict:
+    questions = brief.questions or {}
+    if all(lane in questions for lane in ("sounds_similar", "good_song", "currently_popular")):
+        return questions
+    return build_questions(
+        catalog_verified=False,
+        catalog_reason=brief.comps_reason or "no comparison questions were computed",
+        tracks=[],
+        matches=[],
+        held=[],
+    )
+
+
+def _track_record(brief: ARBrief, beats: list[float], beat_grid: str) -> dict:
+    path = Path(brief.track_path)
+    digest, size = _sha256(path)
+    trims = propose_trims(
+        duration_sec=brief.features.duration_sec,
+        beat_times=beats,
+        hook_onset_sec=brief.features.hook_onset_sec,
+        hook_verified=brief.features.hook_verified,
+        novelty_peak_sec=brief.features.novelty_peak_sec,
+        goal=brief.goal,
+    )
+    trims["beat_grid"] = beat_grid
+    return {
+        "filename": path.name,
+        "audio": {
+            "sha256": digest,
+            "bytes": size,
+            "source_path": brief.track_path,
+            "bytes_included": False,
+            "readable": digest is not None,
+            "reason": None if digest is not None else "file was not readable; no digest to pair",
+        },
+        "duration_sec": round(brief.features.duration_sec, 3),
+        "goal": brief.goal.value,
+        "measurements": _measurements(brief.features),
+        "comps": _comps_block(brief),
+        "questions": _questions(brief),
+        "fit": {"score": round(brief.fit.score, 4), "rationale": brief.fit.rationale},
+        "gaps": [{"code": gap.code, "severity": gap.severity, "message": gap.message} for gap in brief.gaps],
+        "plays": [
+            {"primary": play.primary, "title": play.title, "actions": play.actions, "evidence": play.evidence}
+            for play in brief.plays
+        ],
+        "trims": trims,
+    }
+
+
+def _missing_fields(tracks: list[dict]) -> list[dict]:
+    missing: list[dict] = []
+    for index, track in enumerate(tracks):
+        for name, measurement in track["measurements"].items():
+            if measurement.get("value") is None:
+                missing.append(
+                    {
+                        "field": f"tracks[{index}].measurements.{name}",
+                        "reason": measurement.get("note") or "null",
+                    }
+                )
+        if track["comps"]["status"] != "ok":
+            missing.append({"field": f"tracks[{index}].comps", "reason": track["comps"]["reason"]})
+        questions = track.get("questions") if isinstance(track.get("questions"), dict) else {}
+        for lane in ("sounds_similar", "good_song", "currently_popular"):
+            block = questions.get(lane) if isinstance(questions.get(lane), dict) else {}
+            if block.get("status") != "ok" and block.get("status") != "rated":
+                missing.append(
+                    {
+                        "field": f"tracks[{index}].questions.{lane}",
+                        "reason": block.get("reason") or "unavailable",
+                    }
+                )
+        if track["audio"]["sha256"] is None:
+            missing.append({"field": f"tracks[{index}].audio.sha256", "reason": track["audio"]["reason"]})
+        for edge in ("intro", "outro"):
+            block = track["trims"][edge]
+            if block["status"] != "proposed":
+                missing.append({"field": f"tracks[{index}].trims.{edge}", "reason": block["reason"]})
+    return missing
+
+
+def canonical_body(payload: Mapping[str, object]) -> bytes:
+    """Stable JSON of the handoff, excluding the seal fields that describe those bytes."""
+    body = {key: value for key, value in payload.items() if key not in _META_KEYS}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def posted_bytes(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def seal_handoff(payload: dict) -> dict:
+    sealed = dict(payload)
+    raw = canonical_body(sealed)
+    sealed["payload_utf8_bytes"] = len(raw)
+    sealed["payload_sha256"] = hashlib.sha256(raw).hexdigest()
+    return sealed
+
+
+def validate_handoff(payload: Mapping[str, object]) -> list[str]:
+    """Return structural errors. Empty means the sealed document is complete and within the cap."""
+    errors: list[str] = []
+    required = (
+        "contract",
+        "complete",
+        "missing",
+        "payload_utf8_bytes",
+        "payload_sha256",
+        "audio_bytes_included",
+        "audio_pairing",
+        "tracks",
+        "album_sequence",
+        "workflow",
+        "zz_end",
+    )
+    for key in required:
+        if key not in payload:
+            errors.append(f"missing:{key}")
+    if payload.get("contract") != CONTRACT:
+        errors.append("contract")
+    if payload.get("zz_end") != "complete":
+        errors.append("zz_end")
+    if payload.get("audio_bytes_included") is not False:
+        errors.append("audio_bytes_included")
+    mastering = (payload.get("workflow") or {}).get("mastering") if isinstance(payload.get("workflow"), dict) else None
+    if not isinstance(mastering, dict) or mastering.get("approved") is not False:
+        errors.append("mastering_approved")
+    if not isinstance(mastering, dict) or mastering.get("rendered") is not False:
+        errors.append("mastering_rendered")
+    if not isinstance(mastering, dict) or mastering.get("target_lufs") != TARGET_LUFS:
+        errors.append("mastering_target")
+    tracks = payload.get("tracks")
+    if not isinstance(tracks, list) or not tracks:
+        errors.append("tracks")
+        tracks = []
+    for index, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            errors.append(f"tracks[{index}]")
+            continue
+        for key in ("filename", "audio", "measurements", "comps", "questions", "fit", "gaps", "plays", "trims"):
+            if key not in track:
+                errors.append(f"tracks[{index}].{key}")
+        questions = track.get("questions") if isinstance(track.get("questions"), dict) else {}
+        for lane in ("sounds_similar", "good_song", "currently_popular"):
+            block = questions.get(lane)
+            if not isinstance(block, dict) or "status" not in block or "items" not in block:
+                errors.append(f"tracks[{index}].questions.{lane}")
+                continue
+            if block["status"] not in {"ok", "rated", "unavailable"}:
+                errors.append(f"tracks[{index}].questions.{lane}.status")
+            if block["status"] == "unavailable" and (not block.get("reason") or block.get("items")):
+                errors.append(f"tracks[{index}].questions.{lane}.unavailable")
+        popular = questions.get("currently_popular") if isinstance(questions.get("currently_popular"), dict) else {}
+        if popular.get("status") != "unavailable" or popular.get("items"):
+            errors.append(f"tracks[{index}].questions.currently_popular")
+        measurements = track.get("measurements") if isinstance(track.get("measurements"), dict) else {}
+        for name in _MEASUREMENTS:
+            measurement = measurements.get(name)
+            if not isinstance(measurement, dict):
+                errors.append(f"tracks[{index}].measurements.{name}")
+                continue
+            for field in ("value", "unit", "method", "note"):
+                if field not in measurement:
+                    errors.append(f"tracks[{index}].measurements.{name}.{field}")
+            if measurement.get("value") is None and not measurement.get("note"):
+                errors.append(f"tracks[{index}].measurements.{name}.null_without_note")
+        comps = track.get("comps") if isinstance(track.get("comps"), dict) else {}
+        if comps.get("status") not in {"ok", "unavailable"}:
+            errors.append(f"tracks[{index}].comps.status")
+        if comps.get("status") == "unavailable" and (not comps.get("reason") or comps.get("items")):
+            errors.append(f"tracks[{index}].comps.unavailable")
+        trims = track.get("trims") if isinstance(track.get("trims"), dict) else {}
+        for edge in ("intro", "outro"):
+            if edge not in trims:
+                errors.append(f"tracks[{index}].trims.{edge}")
+        if trims.get("fade_out") is not False or trims.get("applied") is not False:
+            errors.append(f"tracks[{index}].trims.not_applied")
+        blob = json.dumps(track.get("comps")) + json.dumps(track.get("plays"))
+        if "Seed Artist" in blob:
+            errors.append(f"tracks[{index}].fixture_comp")
+    raw = canonical_body(payload)
+    posted = posted_bytes(payload)
+    if len(posted) > MAX_HANDOFF_UTF8_BYTES:
+        errors.append(f"over_bound:{len(posted)}")
+    if payload.get("payload_sha256") != hashlib.sha256(raw).hexdigest():
+        errors.append("payload_sha256")
+    if payload.get("payload_utf8_bytes") != len(raw):
+        errors.append("payload_utf8_bytes")
+    if errors:
+        return errors
+    if payload.get("complete") is not True:
+        errors.append("complete")
+    return errors
+
+
 def build_handoff(
     briefs: list[ARBrief],
     beat_times_by_track: Mapping[str, list[float]] | None = None,
     beat_grid_by_track: Mapping[str, str] | None = None,
 ) -> dict:
-    """Build the JSON body Andre would receive. Does not write audio or open a connection."""
+    """Build the sealed JSON body. Does not write audio or open a connection."""
     beats = beat_times_by_track or {}
     beat_grid = beat_grid_by_track or {}
     tracks: list[dict] = []
     sequence_input: list[dict] = []
     for brief in briefs:
-        path = Path(brief.track_path)
-        digest, size = _sha256(path)
-        track_beats = [float(beat) for beat in beats.get(brief.track_path, [])]
-        trims = propose_trims(
-            duration_sec=brief.features.duration_sec,
-            beat_times=track_beats,
-            hook_onset_sec=brief.features.hook_onset_sec,
-            goal=brief.goal,
-        )
-        trims["beat_grid"] = beat_grid.get(brief.track_path, "not_requested")
         tracks.append(
-            {
-                "path": brief.track_path,
-                "sha256": digest,
-                "bytes": size,
-                "original_read": digest is not None,
-                "brief": brief.to_pretty_dict(),
-                "trims": trims,
-            }
+            _track_record(
+                brief,
+                [float(beat) for beat in beats.get(brief.track_path, [])],
+                beat_grid.get(brief.track_path, "not_requested"),
+            )
         )
         sequence_input.append(
             {
@@ -197,16 +534,31 @@ def build_handoff(
                 "key": brief.features.key,
             }
         )
-    return {
-        "contract": "open-ar.andre.v1",
+    payload = {
+        "contract": CONTRACT,
         "generated_by": f"open-ar {__version__}",
         "bot": {"name": BOT_NAME, "id": BOT_ID, "role": BOT_ROLE},
         "audio_bytes_included": False,
+        "audio_pairing": {
+            "method": "sha256",
+            "bytes_included": False,
+            "upload": "not_performed",
+            "endpoint": None,
+            "note": (
+                "No audio URL is included. Copy the file onto Andre's computer by a path you already trust. "
+                "Hash it with SHA-256 and pair it only when the digest and byte size match. "
+                "If the file is absent, leave the audio unavailable."
+            ),
+        },
         "workflow": workflow_policy(),
         "tracks": tracks,
         "album_sequence": sequence_album(sequence_input),
+        "missing": _missing_fields(tracks),
         "context_notes": list(CONTEXT_NOTES),
+        "zz_end": "complete",
     }
+    payload["complete"] = True
+    return seal_handoff(payload)
 
 
 def _redact(text: str, key: str | None) -> str:
@@ -217,7 +569,7 @@ def _redact(text: str, key: str | None) -> str:
 
 def _post_webhook(url: str, key: str, payload: dict) -> tuple[int, str]:
     """POST once. Do not follow redirects, so the bearer key stays on the original host."""
-    data = json.dumps(payload).encode("utf-8")
+    data = posted_bytes(payload)
     request = urllib.request.Request(
         url,
         data=data,
@@ -256,14 +608,19 @@ def share_with_andre(
     not that Andre finished. Any other outcome leaves delivered=False.
     """
     connection = inspect_connection(env)
+    errors = validate_handoff(handoff)
     result = {
         "connection": connection.public_dict(),
         "attempted": False,
         "delivered": False,
         "http_status": None,
         "detail": "",
+        "validation_errors": errors,
         "handoff": handoff,
     }
+    if errors:
+        result["detail"] = "Not sent. Payload failed validation: " + ", ".join(errors)
+        return result
     if connection.state != "configured_unverified" or not connection._url or not connection._key:
         result["detail"] = "Not sent. Missing or invalid webhook settings: " + ", ".join(connection.missing)
         return result

@@ -92,10 +92,11 @@ def analyze(
         Panel.fit(
             f"[bold]{track.name}[/bold]\n"
             f"Goal: {brief.goal.value} · Fit: {brief.fit.score:.2f}\n"
-            f"{brief.features.tempo_bpm:.0f} BPM · "
+            f"{brief.features.tempo_bpm:.0f} BPM estimate · "
             f"{brief.features.duration_sec/60:.2f} min · "
-            f"hook ~{brief.features.hook_onset_sec:.0f}s · "
-            f"key {brief.features.key or '?'} {brief.features.mode or ''}",
+            f"onset peak {brief.features.novelty_peak_sec or 'n/a'}s (not a verified hook) · "
+            f"key estimate {brief.features.key or '?'} {brief.features.mode or ''} · "
+            f"LUFS {brief.features.integrated_lufs if brief.features.integrated_lufs is not None else 'unavailable'}",
             title="Open A&R",
         )
     )
@@ -106,14 +107,27 @@ def analyze(
         fit_table.add_row(line)
     console.print(fit_table)
 
-    comp_table = Table(title="Nearest comps")
-    comp_table.add_column("Title")
-    comp_table.add_column("Artist")
-    comp_table.add_column("Dist", justify="right")
-    comp_table.add_column("Why")
-    for m in brief.comps[:5]:
-        comp_table.add_row(m.comp.title, m.comp.artist, f"{m.distance:.3f}", ", ".join(m.why))
-    console.print(comp_table)
+    questions = brief.questions or {}
+    if questions:
+        console.print(
+            "sounds similar: "
+            f"{questions['sounds_similar']['status']} · "
+            "good song: "
+            f"{questions['good_song']['status']} · "
+            "currently popular: "
+            f"{questions['currently_popular']['status']}"
+        )
+    if brief.comps_status != "ok":
+        console.print(f"[yellow]Comps unavailable: {brief.comps_reason}[/yellow]")
+    else:
+        comp_table = Table(title="Verified comps")
+        comp_table.add_column("Title")
+        comp_table.add_column("Artist")
+        comp_table.add_column("Dist", justify="right")
+        comp_table.add_column("Why")
+        for m in brief.comps[:5]:
+            comp_table.add_row(m.comp.title, m.comp.artist, f"{m.distance:.3f}", ", ".join(m.why))
+        console.print(comp_table)
 
     _print_plays_and_gaps(brief.gaps, brief.plays, brief.disclaimer)
 
@@ -152,7 +166,8 @@ def analyze_video(
             f"{v.scene_cut_count} cuts ({v.cuts_per_minute:.1f}/min)\n"
             f"open3={v.opening_3s_energy:.2f} open15={v.opening_15s_energy:.2f} · "
             f"hook↔picture sync={v.audio_hook_visual_sync:.2f}\n"
-            f"audio {brief.audio.tempo_bpm:.0f} BPM · hook ~{brief.audio.hook_onset_sec:.0f}s",
+            f"audio {brief.audio.tempo_bpm:.0f} BPM estimate · "
+            f"onset peak {brief.audio.novelty_peak_sec or 'n/a'}s (not a verified hook)",
             title="Open A&R · Music Video",
         )
     )

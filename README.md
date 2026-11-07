@@ -55,9 +55,17 @@ open-ar analyze-video path/to/video.mp4 -g short_form --json mv-brief.json
 open-ar analyze-video path/to/video.mp4 -g premiere -q
 ```
 
-### Bring your own comps
+### Comparison library
 
-Copy `src/open_ar/data/seed_comps.json`, replace with labeled tracks from *your* world, then:
+Three questions stay in separate fields: `sounds_similar`, `good_song`, and `currently_popular`.
+
+`src/open_ar/data/seed_comps.json` is a fixture. It is not a recommendation.
+
+A reference is used for **sounds similar** only when the catalog says `"kind": "verified"` and `"verified": true`, the track has `"permission_cleared": true`, and `"measurement_source": "open_ar"`. That last flag means the reference WAV was measured with this package, so the numbers are on the same scale. MusicBrainz recording MBIDs are identity only. Core MusicBrainz data is CC0. An MBID does not add audio features.
+
+AcousticBrainz low-level and high-level JSON is CC0 and indexed by those MBIDs, but collection stopped in 2022. A track marked `"measurement_source": "acousticbrainz"` is held out of the similarity distance and the reason says so. Essentia models are not bundled; commercial licensing is unchecked. Soundcharts is paid and is not called. Popularity stays `unavailable`. There is no popularity number in the handoff.
+
+**Good song** is only a 1–5 listener rating of `drum_impact`, `hook`, and `conviction`, with a `rater` name. Open A&R does not infer those from an onset peak. Missing ratings stay null with a reason.
 
 ```bash
 open-ar analyze track.wav --comps ./my_comps.json --goal playlist
@@ -75,7 +83,13 @@ open-ar andre share track.wav --goal playlist
 open-ar andre share a.wav b.wav c.wav --goal lead_single --json handoff.json
 ```
 
-`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body contains the brief (features, comps, gaps, plays), an album-order proposal, and beat-aligned trim proposals. It does not contain audio bytes. Original files are left untouched. Open A&R does not measure LUFS and does not render a master. The payload tells Andre: target **-14 LUFS**, no fade-outs, cuts on a beat and never mid-word, and **ask Travis before mastering**. `word_boundary_verified` is false because this repo has no lyric timeline.
+`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body is contract `open-ar.andre.v2`: labeled measurements, an explicit comps status, separate `sounds_similar`, `good_song`, and `currently_popular` lanes, gaps, plays, the album sequence, and trim blocks. A null measurement stays in the JSON with a note and is listed under `missing`. `zz_end` is `complete` only on a sealed document. The client does not slice the request. If validation fails, or the sealed body is over 24 KiB, nothing is posted. Required sections stay in the document either way.
+
+The earlier handoff nested full fixture comps inside each track and put sequence and trims after that block. A summary that stopped mid-comps could hide the tail even though the POST sent the whole object. The response reader still limits itself to 4 KiB; that limit is the reply, not the request.
+
+Audio bytes are not in the body, and there is no audio URL. To pair a brief with a file Andre can already read: copy the file onto his computer yourself, hash it with SHA-256, and accept the pair only when the digest and byte size match `tracks[].audio`. If the file is not there, the audio stays unavailable.
+
+Original files are left untouched. Nothing is mastered. The payload still says target **-14 LUFS**, no fade-outs, cuts on a beat and never mid-word, and **ask Travis before mastering**. Integrated LUFS is measured with ITU-R BS.1770-4 when the file can be gated. The RMS figure is `dB re peak RMS`, not LUFS. An onset peak is not a verified hook, and it is not used as a cut.
 
 ### One-time setup
 
@@ -98,7 +112,8 @@ A template for the variable names is in `.env.example`. Leave the values empty i
 1. **Fit ≠ quality.** Artistic worth is outside this tool’s job.
 2. **Always pair a recommendation with evidence** (comps + gaps).
 3. **Local audio first.** Don’t depend on deprecated Spotify audio-features for new apps.
-4. **Replace seed comps.** The bundled catalog is synthetic demo data.
+4. **Fixture comps stay fixtures.** They are excluded until a catalog is marked `kind: verified` and `verified: true`.
+5. **Name the unit.** RMS relative to the file peak is not LUFS. An onset peak is not a hook. Proxy scores say so.
 
 ## Library API
 

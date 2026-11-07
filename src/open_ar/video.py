@@ -192,12 +192,16 @@ def extract_video_features(path: str | Path) -> tuple[VideoFeatures, AudioFeatur
     extract_audio_wav(path, wav_path)
     audio = extract_features(wav_path)
 
-    # Alignment: how close is first strong cut / peak visual to audio hook.
-    hook = audio.hook_onset_sec
-    candidates = ([first_cut] if first_cut is not None else []) + [peak_visual_sec]
-    best_delta = min(abs(c - hook) for c in candidates) if candidates else abs(peak_visual_sec - hook)
-    # 0 = perfect sync within 0s, 1 = 20s+ off
-    sync_score = max(0.0, min(1.0, 1.0 - best_delta / 20.0))
+    # Alignment uses a verified hook only. An onset peak is recorded, not scored as sync.
+    anchor, basis = audio.timing_anchor()
+    if audio.hook_verified and anchor is not None:
+        candidates = ([first_cut] if first_cut is not None else []) + [peak_visual_sec]
+        best_delta = min(abs(c - anchor) for c in candidates) if candidates else abs(peak_visual_sec - anchor)
+        sync_score = max(0.0, min(1.0, 1.0 - best_delta / 20.0))
+        sync_basis = "verified_hook"
+    else:
+        sync_score = 0.0
+        sync_basis = "not_scored_unverified_hook" if basis == "onset_peak" else "unavailable"
 
     video = VideoFeatures(
         duration_sec=duration,
@@ -213,6 +217,7 @@ def extract_video_features(path: str | Path) -> tuple[VideoFeatures, AudioFeatur
         opening_3s_energy=round(opening_3s_energy, 3),
         opening_15s_energy=round(opening_15s_energy, 3),
         audio_hook_visual_sync=round(sync_score, 3),
+        audio_sync_basis=sync_basis,
         scene_cut_times_sec=[round(t, 2) for t in cuts[:40]],
     )
     return video, audio, wav_path

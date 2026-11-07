@@ -81,6 +81,7 @@ def _slot(track: dict, position: int, role: str, why: str) -> dict:
         "energy": track["energy"],
         "tempo_bpm": track["tempo_bpm"],
         "key": track.get("key"),
+        "energy_unit": "proxy_0_1_clipped_rms",
         "why": why,
         "file_changed": False,
     }
@@ -90,8 +91,10 @@ def propose_trims(
     *,
     duration_sec: float,
     beat_times: list[float],
-    hook_onset_sec: float,
+    hook_onset_sec: float | None,
     goal: Goal | str,
+    hook_verified: bool = False,
+    novelty_peak_sec: float | None = None,
 ) -> dict:
     """Propose cuts that already exist on the beat grid. Never applies them.
 
@@ -112,54 +115,91 @@ def propose_trims(
         ),
         "target_sec": PLAYLIST_MAX_SEC if goal in (Goal.playlist, Goal.lead_single) else None,
         "proposals": [],
+        "intro": {
+            "status": "unavailable",
+            "reason": "No verified hook. The strongest onset peak is not a cut point.",
+            "novelty_peak_sec": novelty_peak_sec,
+            "at_sec": None,
+            "applied": False,
+            "fade_out": False,
+        },
+        "outro": {
+            "status": "unavailable",
+            "reason": "No outro cut proposed for this goal.",
+            "at_sec": None,
+            "applied": False,
+            "fade_out": False,
+        },
     }
     if goal not in (Goal.playlist, Goal.lead_single):
         return base
 
-    if hook_onset_sec > LATE_HOOK_SEC:
+    if hook_verified and hook_onset_sec is not None and hook_onset_sec > LATE_HOOK_SEC:
         intro_candidates = [beat for beat in beats if 8.0 <= beat < hook_onset_sec - 0.25]
         if intro_candidates:
             cut = intro_candidates[-1]
-            base["proposals"].append(
-                _proposal(
-                    "trim_intro",
-                    cut,
-                    True,
-                    (
-                        f"hook proxy is {hook_onset_sec:.1f}s, after the {LATE_HOOK_SEC:.0f}s "
-                        "playlist window. Proposed start is the latest beat still before that hook. "
-                        "No fade. Not applied."
-                    ),
-                )
+            proposal = _proposal(
+                "trim_intro",
+                cut,
+                True,
+                (
+                    f"Verified hook is {hook_onset_sec:.1f}s, after the {LATE_HOOK_SEC:.0f}s "
+                    "playlist window. Proposed start is the latest beat still before that hook. "
+                    "No fade. Not applied."
+                ),
             )
+            base["proposals"].append(proposal)
+            base["intro"] = {
+                "status": "proposed",
+                "reason": proposal["why"],
+                "novelty_peak_sec": novelty_peak_sec,
+                "at_sec": cut,
+                "applied": False,
+                "fade_out": False,
+            }
 
     if duration_sec > PLAYLIST_MAX_SEC + 1.0:
         outro_candidates = [beat for beat in beats if beat <= PLAYLIST_MAX_SEC]
         if outro_candidates:
             cut = outro_candidates[-1]
-            base["proposals"].append(
-                _proposal(
-                    "trim_outro",
-                    cut,
-                    True,
-                    (
-                        f"duration {duration_sec:.1f}s is past {PLAYLIST_MAX_SEC:.0f}s. "
-                        "Proposed end is the last beat at or before that ceiling. No fade-out. Not applied."
-                    ),
-                )
+            proposal = _proposal(
+                "trim_outro",
+                cut,
+                True,
+                (
+                    f"duration {duration_sec:.1f}s is past {PLAYLIST_MAX_SEC:.0f}s. "
+                    "Proposed end is the last beat at or before that ceiling. No fade-out. Not applied."
+                ),
             )
+            base["proposals"].append(proposal)
+            base["outro"] = {
+                "status": "proposed",
+                "reason": proposal["why"],
+                "at_sec": cut,
+                "applied": False,
+                "fade_out": False,
+            }
         else:
-            base["proposals"].append(
-                _proposal(
-                    "refused",
-                    None,
-                    False,
-                    (
-                        f"duration {duration_sec:.1f}s is past {PLAYLIST_MAX_SEC:.0f}s, "
-                        "and no beat falls at or before that ceiling. Refusing a mid-beat cut."
-                    ),
-                )
+            reason = (
+                f"duration {duration_sec:.1f}s is past {PLAYLIST_MAX_SEC:.0f}s, "
+                "and no beat falls at or before that ceiling. Refusing a mid-beat cut."
             )
+            base["proposals"].append(_proposal("refused", None, False, reason))
+            base["outro"] = {
+                "status": "refused",
+                "reason": reason,
+                "at_sec": None,
+                "applied": False,
+                "fade_out": False,
+            }
+    else:
+        base["outro"] = {
+            "status": "unavailable",
+            "reason": f"Runtime {duration_sec:.1f}s is within {PLAYLIST_MAX_SEC:.0f}s. No outro cut proposed.",
+            "at_sec": None,
+            "applied": False,
+            "fade_out": False,
+        }
     return base
 
 
