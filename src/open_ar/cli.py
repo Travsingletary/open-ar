@@ -11,7 +11,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from open_ar import __version__
+from open_ar.andre import build_handoff, inspect_connection, share_with_andre
 from open_ar.brief import build_brief
+from open_ar.edits import read_beat_times
 from open_ar.schema import Goal, VideoGoal
 from open_ar.video_brief import build_video_brief
 
@@ -171,6 +173,95 @@ def analyze_video(
     console.print(clip_table)
 
     _print_plays_and_gaps(brief.gaps, brief.plays, brief.disclaimer)
+
+
+andre_app = typer.Typer(
+    help=(
+        "Hand off measured briefs to Andre · A&R through a Grok Bot routine webhook. "
+        "Stays disconnected until you set the routine URL and key."
+    )
+)
+app.add_typer(andre_app, name="andre")
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    console.print(f"[dim]Wrote {path}[/dim]")
+
+
+@andre_app.command("status")
+def andre_status(
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write connection JSON to path"),
+) -> None:
+    """Show whether Andre's routine webhook is configured. Does not call Grok Bot."""
+    info = inspect_connection().public_dict()
+    if json_out:
+        _write_json(json_out, info)
+    missing = ", ".join(info["missing"]) if info["missing"] else "none"
+    console.print(
+        Panel.fit(
+            f"[bold]{info['bot']['name']}[/bold]\n"
+            f"{info['bot']['role']}\n"
+            f"id: {info['bot']['id']}\n"
+            f"state: {info['state']}\n"
+            f"transport: {info['transport']}\n"
+            f"url set: {info['url_set']} · key set: {info['key_set']}\n"
+            f"missing: {missing}\n"
+            "The bot id is not an endpoint. Status does not contact Grok Bot.",
+            title="Open A&R · Andre",
+        )
+    )
+
+
+@andre_app.command("share")
+def andre_share(
+    tracks: list[Path] = typer.Argument(..., exists=True, readable=True, help="Audio files to brief"),
+    goal: GoalOption = typer.Option(GoalOption.playlist, "--goal", "-g", help="Strategic goal"),
+    comps: Optional[Path] = typer.Option(None, "--comps", help="Optional comps JSON catalog"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the local result JSON to path"),
+) -> None:
+    """Analyze tracks and POST the handoff when a webhook is configured.
+
+    Exit 0 only when Grok Bot returns 200 (run started, not finished).
+    Exit 2 when nothing was sent. Original audio is not modified or mastered.
+    """
+    briefs = []
+    beats: dict[str, list[float]] = {}
+    beat_grid: dict[str, str] = {}
+    for track in tracks:
+        brief = build_brief(track, goal=Goal(goal.value), comps_path=comps)
+        briefs.append(brief)
+        try:
+            beats[brief.track_path] = read_beat_times(brief.track_path)
+            beat_grid[brief.track_path] = "ok"
+        except Exception:
+            # Beat tracking can fail per file. Keep the brief and say the grid is unavailable.
+            beats[brief.track_path] = []
+            beat_grid[brief.track_path] = "unavailable"
+    before = {track: track.read_bytes() for track in tracks}
+    handoff = build_handoff(briefs, beats, beat_grid)
+    result = share_with_andre(handoff)
+    for track, original in before.items():
+        if track.read_bytes() != original:
+            raise RuntimeError(f"Original audio changed during share: {track}")
+    if json_out:
+        _write_json(json_out, result)
+    state = result["connection"]["state"]
+    console.print(
+        Panel.fit(
+            f"state: {state}\n"
+            f"attempted: {result['attempted']}\n"
+            f"delivered: {result['delivered']}\n"
+            f"{result['detail']}\n"
+            "Original files were not modified. No master was rendered.",
+            title="Open A&R · Andre share",
+        )
+    )
+    if result["delivered"]:
+        raise typer.Exit(code=0)
+    if not result["attempted"]:
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

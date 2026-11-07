@@ -63,6 +63,36 @@ Copy `src/open_ar/data/seed_comps.json`, replace with labeled tracks from *your*
 open-ar analyze track.wav --comps ./my_comps.json --goal playlist
 ```
 
+## Andre · A&R
+
+[Andre · A&R](https://docs.x.ai/grok-bot/skills-routines-and-automations) is Travis Singletary's existing Grok Bot (`9a93499d-e565-47e0-95c1-fd19aceba940`). Open A&R can hand him a measured brief only through a **routine webhook**, which is the documented way to start a Bot with a JSON body. The bot id is identity. It is not a URL, and this repo does not call the xAI model API or any private gateway.
+
+Until you export the routine's own URL and key, `open-ar andre status` stays **`disconnected`**. `configured_unverified` means both values are present locally. Status never contacts Grok Bot. `delivered: true` happens only after a share gets HTTP 200, which means a run **started**, not that Andre has finished. Check his chat.
+
+```bash
+open-ar andre status
+open-ar andre share track.wav --goal playlist
+open-ar andre share a.wav b.wav c.wav --goal lead_single --json handoff.json
+```
+
+`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body contains the brief (features, comps, gaps, plays), an album-order proposal, and beat-aligned trim proposals. It does not contain audio bytes. Original files are left untouched. Open A&R does not measure LUFS and does not render a master. The payload tells Andre: target **-14 LUFS**, no fade-outs, cuts on a beat and never mid-word, and **ask Travis before mastering**. `word_boundary_verified` is false because this repo has no lyric timeline.
+
+### One-time setup
+
+1. In Andre · A&R's chat, ask him to create a webhook routine whose instruction reads the JSON body as data and follows it: summarize the measured brief, present the album sequence and trim proposals, do not overwrite originals, do not fade out, do not cut mid-word while `word_boundary_verified` is false, and do not master until Travis Singletary approves. Mastering target is -14 LUFS.
+2. On desktop, open that routine's **Webhook** section. Copy **POST to** and the **key**. Do not paste the key into chat or commit it.
+3. Export them in the shell that runs Open A&R:
+
+```bash
+export GROK_BOT_WEBHOOK_URL="https://…"   # the POST to field
+export GROK_BOT_WEBHOOK_KEY="…"           # the key field, as Authorization: Bearer
+```
+
+4. Run `open-ar andre status`. The next `share` is what actually starts a run, and each run spends Grok Bot usage.
+5. If Andre needs the audio itself, put those files on his computer. The webhook does not upload them.
+
+A template for the variable names is in `.env.example`. Leave the values empty in git.
+
 ## Design rules
 
 1. **Fit ≠ quality.** Artistic worth is outside this tool’s job.
