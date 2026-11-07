@@ -1,0 +1,4 @@
+date,source,metric,value,denominator,variant
+2026-01-05,first_party_export,landing_clicks,12,100,message_a
+2026-01-12,first_party_export,landing_clicks,18,100,message_a
+2026-02-02,first_party_export,landing_clicks,9,90,message_b

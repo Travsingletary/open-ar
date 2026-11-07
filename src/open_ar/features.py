@@ -9,6 +9,11 @@ import soundfile as sf
 from open_ar.loudness import integrated_lufs
 from open_ar.schema import AudioFeatures
 
+# Bump this when the extractor outputs change meaning. A catalog row can enter
+# find_comps only when its feature_version equals this string and produced_by
+# is "extracted".
+FEATURE_SCHEMA_VERSION = "open-ar-features-1"
+
 # Pitch-class → rough key label (major assumed when mode unclear).
 _KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 

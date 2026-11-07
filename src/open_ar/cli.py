@@ -11,11 +11,15 @@ from rich.panel import Panel
 from rich.table import Table
 
 from open_ar import __version__
+from open_ar.acousticbrainz import add_to_catalog
 from open_ar.andre import build_handoff, inspect_connection, share_with_andre
 from open_ar.brief import build_brief
-from open_ar.marketing import load_marketing_notes
+from open_ar.comps import similarity_problem
 from open_ar.edits import read_beat_times
-from open_ar.schema import Goal, VideoGoal
+from open_ar.feedback import DEFAULT_FEEDBACK_PATH, add_record, held_out_check, load_store
+from open_ar.marketing import load_marketing_notes
+from open_ar.schema import CompTrack, Goal, VideoGoal
+from open_ar.strategy import build_strategy
 from open_ar.video_brief import build_video_brief
 
 app = typer.Typer(
@@ -81,11 +85,32 @@ def analyze(
         readable=True,
         help="Local marketing notes JSON. Not popularity and not Soundcharts.",
     ),
+    trends: Optional[Path] = typer.Option(
+        None,
+        "--trends",
+        exists=True,
+        readable=True,
+        help="Local Google Trends CSV you already downloaded. Not a live Google call.",
+    ),
+    analytics: Optional[Path] = typer.Option(
+        None,
+        "--analytics",
+        exists=True,
+        readable=True,
+        help="Local first-party analytics CSV you already downloaded.",
+    ),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write full brief JSON to path"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print primary play title"),
 ) -> None:
     """Analyze a track and print an A&R strategy brief."""
-    brief = build_brief(track, goal=Goal(goal.value), comps_path=comps, marketing_path=marketing)
+    brief = build_brief(
+        track,
+        goal=Goal(goal.value),
+        comps_path=comps,
+        marketing_path=marketing,
+        trends_path=trends,
+        analytics_path=analytics,
+    )
 
     if json_out:
         json_out.write_text(json.dumps(brief.to_pretty_dict(), indent=2), encoding="utf-8")
@@ -130,6 +155,13 @@ def analyze(
         "marketing notes: "
         f"{marketing_notes.get('status', 'unavailable')} · "
         f"source: {marketing_notes.get('source') or 'none'}"
+    )
+    attention = brief.attention_evidence or {}
+    console.print(
+        "attention evidence: "
+        f"{attention.get('status', 'unavailable')} · "
+        f"observations {len(attention.get('observations') or [])} · "
+        f"rejected {len(attention.get('rejected') or [])}"
     )
     if brief.comparison_held:
         held_table = Table(title="Held out of similarity")
@@ -324,6 +356,153 @@ def andre_share(
     if not result["attempted"]:
         raise typer.Exit(code=2)
     raise typer.Exit(code=1)
+
+
+@app.command("import-acousticbrainz")
+def import_acousticbrainz_cmd(
+    lowlevel: Path = typer.Argument(..., exists=True, readable=True, help="Local AcousticBrainz low-level JSON"),
+    catalog: Path = typer.Option(..., "--catalog", help="Catalog JSON to create or update"),
+) -> None:
+    """Import a local AcousticBrainz low-level file as a held row. No network."""
+    result = add_to_catalog(lowlevel, catalog)
+    track = CompTrack.model_validate(result["track"])
+    reason = similarity_problem(track)
+    console.print(
+        Panel.fit(
+            f"id: {track.id}\n"
+            f"held: {result['held']}\n"
+            f"reason: {reason}\n"
+            f"catalog: {result['catalog']}\n"
+            "The row is not a similarity comp. AcousticBrainz was not contacted.",
+            title="Open A&R · AcousticBrainz import",
+        )
+    )
+
+
+@app.command("strategy")
+def strategy_cmd(
+    brief: Path = typer.Option(..., "--brief", exists=True, readable=True, help="Brief JSON from open-ar analyze --json"),
+    trends: Optional[Path] = typer.Option(
+        None,
+        "--trends",
+        exists=True,
+        readable=True,
+        help="Local Google Trends CSV you already downloaded.",
+    ),
+    analytics: Optional[Path] = typer.Option(
+        None,
+        "--analytics",
+        exists=True,
+        readable=True,
+        help="Local first-party analytics CSV you already downloaded.",
+    ),
+    marketing: Optional[Path] = typer.Option(
+        None,
+        "--marketing",
+        exists=True,
+        readable=True,
+        help="Local marketing notes JSON.",
+    ),
+    feedback: Optional[Path] = typer.Option(
+        None,
+        "--feedback",
+        help="Feedback JSON. Defaults to .data/feedback.json when that file exists.",
+    ),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the strategy JSON"),
+) -> None:
+    """Write audience hypotheses and, only with enough dated rates, a comparison.
+
+    No scheduler, no post, and no master. Insufficient evidence stays labeled.
+    """
+    feedback_path = feedback
+    if feedback_path is None and DEFAULT_FEEDBACK_PATH.is_file():
+        feedback_path = DEFAULT_FEEDBACK_PATH
+    try:
+        document = build_strategy(
+            brief,
+            trends_path=trends,
+            analytics_path=analytics,
+            marketing_path=marketing,
+            feedback_path=feedback_path,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=2) from exc
+    if json_out:
+        _write_json(json_out, document)
+    mastering = document["asset"]["mastering"]
+    console.print(
+        Panel.fit(
+            f"hypotheses: {document['hypothesis_status']} ({len(document['hypotheses'])})\n"
+            f"comparison: {document['comparison']['status']}\n"
+            f"currently popular: {document['currently_popular']['status']}\n"
+            f"mastering approved: {mastering['approved']} · rendered: {mastering['rendered']}\n"
+            "Hypotheses are labeled hypotheses. This is not a hit prediction and nothing was posted.",
+            title="Open A&R · strategy",
+        )
+    )
+
+
+feedback_app = typer.Typer(help="Store explicit ratings, corrections, and campaign outcomes locally.")
+app.add_typer(feedback_app, name="feedback")
+
+
+@feedback_app.command("add")
+def feedback_add(
+    track_id: str = typer.Option(..., "--track-id", help="Target track id"),
+    rater: str = typer.Option(..., "--rater", help="Who supplied this record"),
+    kind: str = typer.Option("rating", "--kind", help="rating, correction, or campaign_outcome"),
+    corrected: str = typer.Option(..., "--corrected", help="What the user corrected or rated"),
+    source: str = typer.Option("user", "--source", help="user, or another label you supply"),
+    detail: str = typer.Option("", "--detail", help="Short note in your own words"),
+    drum_impact: Optional[int] = typer.Option(None, "--drum-impact", min=1, max=5),
+    hook: Optional[int] = typer.Option(None, "--hook", min=1, max=5),
+    conviction: Optional[int] = typer.Option(None, "--conviction", min=1, max=5),
+    held_out: bool = typer.Option(False, "--held-out", help="Mark this row held out of the rating rule"),
+    file: Path = typer.Option(DEFAULT_FEEDBACK_PATH, "--file", help="Feedback JSON path"),
+) -> None:
+    """Append one user-supplied record. Does not train a model or rewrite audio features."""
+    record = add_record(
+        file,
+        target_track_id=track_id,
+        rater=rater,
+        kind=kind,
+        corrected=corrected,
+        source=source,
+        held_out=held_out,
+        drum_impact=drum_impact,
+        hook=hook,
+        conviction=conviction,
+        detail=detail,
+        user_supplied=True,
+    )
+    console.print(
+        f"stored {record['kind']} for {record['target_track_id']} in {file} "
+        f"(user_supplied={record['user_supplied']}, held_out={record['held_out']})"
+    )
+
+
+@feedback_app.command("check")
+def feedback_check(
+    file: Path = typer.Option(DEFAULT_FEEDBACK_PATH, "--file", help="Feedback JSON path"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write the check JSON"),
+) -> None:
+    """Show whether a held-out rating was kept out of the rule. Does not fit a model."""
+    store = load_store(file)
+    records = [record for record in store.get("records", []) if isinstance(record, dict)]
+    report = held_out_check(records)
+    if json_out:
+        _write_json(json_out, report)
+    console.print(
+        Panel.fit(
+            f"held-out check: {report['held_out_check']}\n"
+            f"personalization: {report['personalization']}\n"
+            f"model fit: {report['model_fit']}\n"
+            f"rule uses held-out rows: {report['rule_uses_held_out']}\n"
+            f"{report.get('reason') or 'Held-out rows were compared and not used to build the rule.'}",
+            title="Open A&R · feedback",
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import soundfile as sf
 
 from open_ar.andre import build_handoff, validate_handoff
 from open_ar.brief import build_brief
+from open_ar.features import FEATURE_SCHEMA_VERSION
 from open_ar.schema import Goal
 
 
@@ -42,6 +43,8 @@ def _track(track_id: str, **extra) -> dict:
         "measurement_source": "open_ar",
         "permission_cleared": True,
         "permission_note": "Owner supplied the reference file.",
+        "feature_version": FEATURE_SCHEMA_VERSION,
+        "produced_by": "extracted",
         "features": _features(),
     }
     base.update(extra)

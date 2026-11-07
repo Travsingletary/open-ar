@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from open_ar.evidence import unavailable_attention
 from open_ar.marketing import unavailable_marketing
 
 
@@ -80,7 +81,14 @@ class CompTrack(BaseModel):
     musicbrainz_recording_mbid: str | None = None
     measurement_source: str = "unspecified"
     permission_cleared: bool = False
+    # Rights note. An empty note keeps the row out of similarity distance.
     permission_note: str = ""
+    # Must equal open_ar.features.FEATURE_SCHEMA_VERSION for a similarity comp.
+    feature_version: str | None = None
+    # "extracted" means this package measured a file. "hand_typed" is not a comp.
+    produced_by: str = ""
+    # AcousticBrainz and other off-scale measurements. find_comps does not read this.
+    historical: dict[str, Any] | None = None
     ratings: SongRatings | None = None
 
 
@@ -144,6 +152,7 @@ class ARBrief(BaseModel):
     comparison_held: list[dict[str, Any]] = Field(default_factory=list)
     questions: dict[str, Any] = Field(default_factory=dict)
     marketing_notes: dict[str, Any] = Field(default_factory=unavailable_marketing)
+    attention_evidence: dict[str, Any] = Field(default_factory=unavailable_attention)
     fit: FitScore
     gaps: list[Gap]
     plays: list[Play]

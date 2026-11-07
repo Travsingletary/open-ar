@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from open_ar.features import feature_vector
+from open_ar.features import FEATURE_SCHEMA_VERSION, feature_vector
 from open_ar.schema import AudioFeatures, CompMatch, CompTrack, Goal, SongRatings
 
 FIXTURE_EXCLUDED = "Bundled examples are fixtures, not artist or chart comparisons."
@@ -19,9 +19,12 @@ POPULARITY_UNAVAILABLE = (
 )
 ACOUSTICBRAINZ_HELD = (
     "AcousticBrainz measurements are CC0 historical descriptors. Collection stopped in 2022. "
-    "They are not on the Open A&R scale, so they are not similarity comps."
+    "They are an incompatible method and are not on the Open A&R scale, so they are not similarity comps."
 )
 ESSENTIA_HELD = "Essentia models are not used. Commercial licensing has not been checked."
+MISSING_RIGHTS = "missing rights note"
+HAND_TYPED = "features were hand-typed, not extracted by this package"
+NOT_EXTRACTED = "features were not extracted by this package"
 
 
 @dataclass(frozen=True)
@@ -86,21 +89,40 @@ def _mbid_problem(value: str | None) -> str | None:
     return None
 
 
+def feature_version_problem(track: CompTrack) -> str | None:
+    version = (track.feature_version or "").strip()
+    if version != FEATURE_SCHEMA_VERSION:
+        return f"feature_version is missing or does not match {FEATURE_SCHEMA_VERSION}"
+    return None
+
+
 def similarity_problem(track: CompTrack) -> str | None:
-    """Why this track cannot answer 'sounds similar'. None means it can."""
+    """Why this track cannot answer 'sounds similar'. None means it can.
+
+    AcousticBrainz and Essentia are rejected before the rights check so the
+    reason stays the incompatible method. Historical descriptor blocks are
+    not read here and are not a distance.
+    """
     mbid_problem = _mbid_problem(track.musicbrainz_recording_mbid)
     if mbid_problem:
         return mbid_problem
-    if not track.permission_cleared:
-        return "no permission clearance"
     source = track.measurement_source
     if source == "acousticbrainz":
         return ACOUSTICBRAINZ_HELD
     if source == "essentia":
         return ESSENTIA_HELD
+    if not track.permission_cleared:
+        return "no permission clearance"
     if source != "open_ar":
         return "measurement_source is not open_ar, so the reference is not compatible with this brief"
-    return None
+    if not track.permission_note.strip():
+        return MISSING_RIGHTS
+    produced = (track.produced_by or "").strip()
+    if produced == "hand_typed":
+        return HAND_TYPED
+    if produced != "extracted":
+        return NOT_EXTRACTED
+    return feature_version_problem(track)
 
 
 def complete_ratings(track: CompTrack) -> SongRatings | None:
@@ -237,6 +259,9 @@ def find_comps(
 
     scored: list[tuple[float, CompTrack]] = []
     for comp in comps:
+        # Held methods, including AcousticBrainz historical blocks, never enter the norm.
+        if similarity_problem(comp):
+            continue
         dist = float(np.linalg.norm(query - feature_vector(comp.features)))
         # Soft prefer comps tagged for the requested goal.
         if goal.value in comp.goal_tags:

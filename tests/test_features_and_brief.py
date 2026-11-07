@@ -7,7 +7,7 @@ import json
 
 from open_ar.brief import build_brief
 from open_ar.comps import load_catalog
-from open_ar.features import extract_features
+from open_ar.features import FEATURE_SCHEMA_VERSION, extract_features
 from open_ar.schema import Goal
 
 
@@ -83,6 +83,8 @@ def test_only_a_verified_catalog_is_used(tmp_path: Path):
                         "measurement_source": "open_ar",
                         "permission_cleared": True,
                         "permission_note": "Reference file supplied by the catalog owner.",
+                        "feature_version": FEATURE_SCHEMA_VERSION,
+                        "produced_by": "extracted",
                         "features": features,
                     }
                 ],
