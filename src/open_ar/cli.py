@@ -13,6 +13,7 @@ from rich.table import Table
 from open_ar import __version__
 from open_ar.andre import build_handoff, inspect_connection, share_with_andre
 from open_ar.brief import build_brief
+from open_ar.marketing import load_marketing_notes
 from open_ar.edits import read_beat_times
 from open_ar.schema import Goal, VideoGoal
 from open_ar.video_brief import build_video_brief
@@ -73,11 +74,18 @@ def analyze(
     track: Path = typer.Argument(..., exists=True, readable=True, help="Path to audio file"),
     goal: GoalOption = typer.Option(GoalOption.playlist, "--goal", "-g", help="Strategic goal"),
     comps: Optional[Path] = typer.Option(None, "--comps", help="Optional comps JSON catalog"),
+    marketing: Optional[Path] = typer.Option(
+        None,
+        "--marketing",
+        exists=True,
+        readable=True,
+        help="Local marketing notes JSON. Not popularity and not Soundcharts.",
+    ),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write full brief JSON to path"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print primary play title"),
 ) -> None:
     """Analyze a track and print an A&R strategy brief."""
-    brief = build_brief(track, goal=Goal(goal.value), comps_path=comps)
+    brief = build_brief(track, goal=Goal(goal.value), comps_path=comps, marketing_path=marketing)
 
     if json_out:
         json_out.write_text(json.dumps(brief.to_pretty_dict(), indent=2), encoding="utf-8")
@@ -117,6 +125,19 @@ def analyze(
             "currently popular: "
             f"{questions['currently_popular']['status']}"
         )
+    marketing_notes = brief.marketing_notes or {}
+    console.print(
+        "marketing notes: "
+        f"{marketing_notes.get('status', 'unavailable')} · "
+        f"source: {marketing_notes.get('source') or 'none'}"
+    )
+    if brief.comparison_held:
+        held_table = Table(title="Held out of similarity")
+        held_table.add_column("Title")
+        held_table.add_column("Reason")
+        for item in brief.comparison_held:
+            held_table.add_row(str(item.get("title") or item.get("id") or ""), str(item.get("reason") or ""))
+        console.print(held_table)
     if brief.comps_status != "ok":
         console.print(f"[yellow]Comps unavailable: {brief.comps_reason}[/yellow]")
     else:
@@ -233,6 +254,13 @@ def andre_share(
     tracks: list[Path] = typer.Argument(..., exists=True, readable=True, help="Audio files to brief"),
     goal: GoalOption = typer.Option(GoalOption.playlist, "--goal", "-g", help="Strategic goal"),
     comps: Optional[Path] = typer.Option(None, "--comps", help="Optional comps JSON catalog"),
+    marketing: Optional[Path] = typer.Option(
+        None,
+        "--marketing",
+        exists=True,
+        readable=True,
+        help="Local marketing notes JSON. Not popularity and not Soundcharts.",
+    ),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write the local result JSON to path"),
 ) -> None:
     """Analyze tracks and POST the handoff when a webhook is configured.
@@ -240,11 +268,17 @@ def andre_share(
     Exit 0 only when Grok Bot returns 200 (run started, not finished).
     Exit 2 when nothing was sent. Original audio is not modified or mastered.
     """
+    notes = load_marketing_notes(marketing)
     briefs = []
     beats: dict[str, list[float]] = {}
     beat_grid: dict[str, str] = {}
     for track in tracks:
-        brief = build_brief(track, goal=Goal(goal.value), comps_path=comps)
+        brief = build_brief(
+            track,
+            goal=Goal(goal.value),
+            comps_path=comps,
+            marketing_path=marketing,
+        )
         briefs.append(brief)
         try:
             beats[brief.track_path] = read_beat_times(brief.track_path)
@@ -254,7 +288,7 @@ def andre_share(
             beats[brief.track_path] = []
             beat_grid[brief.track_path] = "unavailable"
     before = {track: track.read_bytes() for track in tracks}
-    handoff = build_handoff(briefs, beats, beat_grid)
+    handoff = build_handoff(briefs, beats, beat_grid, marketing_notes=notes)
     result = share_with_andre(handoff)
     for track, original in before.items():
         if track.read_bytes() != original:
@@ -262,11 +296,24 @@ def andre_share(
     if json_out:
         _write_json(json_out, result)
     state = result["connection"]["state"]
+    handoff_body = result["handoff"]
+    marketing_status = (handoff_body.get("marketing_notes") or {}).get("status", "unavailable")
+    marketing_source = (handoff_body.get("marketing_notes") or {}).get("source") or "none"
+    popular_status = (handoff_body.get("currently_popular") or {}).get("status", "unavailable")
+    similar_status = "unavailable"
+    tracks_out = handoff_body.get("tracks") or []
+    if tracks_out:
+        similar_status = (
+            (tracks_out[0].get("questions") or {}).get("sounds_similar") or {}
+        ).get("status", "unavailable")
     console.print(
         Panel.fit(
             f"state: {state}\n"
             f"attempted: {result['attempted']}\n"
             f"delivered: {result['delivered']}\n"
+            f"sounds similar: {similar_status}\n"
+            f"currently popular: {popular_status}\n"
+            f"marketing notes: {marketing_status} · source: {marketing_source}\n"
             f"{result['detail']}\n"
             "Original files were not modified. No master was rendered.",
             title="Open A&R · Andre share",

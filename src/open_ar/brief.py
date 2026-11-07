@@ -4,6 +4,7 @@ from pathlib import Path
 
 from open_ar.comps import build_questions, find_comps, load_catalog, split_catalog
 from open_ar.features import extract_features
+from open_ar.marketing import load_marketing_notes
 from open_ar.playbook import build_plays, detect_gaps, score_fit
 from open_ar.schema import ARBrief, AudioFeatures, Goal
 
@@ -13,6 +14,7 @@ def build_brief(
     goal: Goal | str = Goal.playlist,
     comps_path: str | Path | None = None,
     features: AudioFeatures | None = None,
+    marketing_path: str | Path | None = None,
 ) -> ARBrief:
     goal = Goal(goal) if isinstance(goal, str) else goal
     track_path = Path(track_path)
@@ -46,6 +48,8 @@ def build_brief(
     fit = score_fit(feats, goal, matches)
     gaps = detect_gaps(feats, goal, matches)
     plays = build_plays(feats, goal, fit, gaps, matches)
+    # Notes are attached after fit, distance, comps, and ratings are already fixed.
+    marketing_notes = load_marketing_notes(marketing_path)
     return ARBrief(
         track_path=str(track_path),
         goal=goal,
@@ -55,6 +59,7 @@ def build_brief(
         comps_reason=comps_reason,
         comparison_held=held,
         questions=questions,
+        marketing_notes=marketing_notes,
         fit=fit,
         gaps=gaps,
         plays=plays,

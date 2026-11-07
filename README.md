@@ -14,7 +14,7 @@ open-ar analyze-video your-video.mp4 --goal youtube_mv
 
 **Audio brief**
 - Sonic snapshot (BPM, energy, hook timing proxy, key/mode estimate)
-- Nearest **comps** from a seed catalog (bring your own)
+- Nearest **comps** when you pass a permission-cleared catalog (`--comps`)
 - **Fit score** for a goal (`playlist`, `club`, `sync`, `cult`, `lead_single`)
 - **Gaps** / **Plays** — strategy with evidence
 
@@ -71,6 +71,51 @@ AcousticBrainz low-level and high-level JSON is CC0 and indexed by those MBIDs, 
 open-ar analyze track.wav --comps ./my_comps.json --goal playlist
 ```
 
+`examples/permission_cleared_catalog.example.json` is that shape. It is not seed artists and it is not a copyrighted recording. Copy it, replace the `measurement_source: open_ar` row with features from a WAV you have permission to compare, and pass the copy with `--comps`. `open-ar analyze` and `open-ar andre share` load that file through `--comps`.
+
+Rows stay held, with the existing reasons, when they are AcousticBrainz, Essentia, uncleared, or an MBID that is not a UUID. A MusicBrainz recording MBID is only an identifier. The command does not call MusicBrainz.
+
+```bash
+cp examples/permission_cleared_catalog.example.json my_comps.json
+open-ar analyze path/to/reference.wav --json reference-features.json
+open-ar analyze path/to/track.wav --comps my_comps.json --goal playlist
+open-ar andre share path/to/track.wav --comps my_comps.json --goal playlist
+```
+
+Put the measured features into `my_comps.json` yourself. Distance to the untouched example is distance to a synthetic placeholder, not to a real song. Optional `ratings` on a reference (`drum_impact`, `hook`, `conviction` from 1 to 5, plus `rater`) answer **good song** only. They do not move distance or fit.
+
+### Local marketing notes
+
+Marketing notes are a separate document-level handoff lane. They are not `sounds_similar`, not `good_song`, and not `currently_popular`. There is no chart rank and no stream count. Nothing is fetched.
+
+`examples/marketing_notes.example.json` shows `campaign`, `audience`, `playlist_pitch`, `radio`, `notes`, and `supplied_by`. The handoff sets `source` to `local_notes`. If you omit `--marketing`, the lane is `unavailable` and the reason says so. A popularity number in that file or in the catalog is ignored. Notes do not change fit, distance, comps, or ratings.
+
+```bash
+cp examples/marketing_notes.example.json my_marketing.json
+open-ar analyze path/to/track.wav --comps my_comps.json --marketing my_marketing.json --goal playlist
+open-ar andre share path/to/track.wav --comps my_comps.json --marketing my_marketing.json --json handoff.json
+```
+
+### Update the local app on your Mac and retest a WAV
+
+The 154 second claims (74 BPM, A# major, RMS -10.9 dB re peak, energy 1, acousticness 0.94, danceability 0.29, onset 142.8s) are not verified until you run that file on your Mac. This checkout has no copy of that WAV.
+
+```bash
+cd /path/to/open-ar
+git fetch origin cursor/andre-ar-webhook-2ea1
+git checkout cursor/andre-ar-webhook-2ea1
+git pull --ff-only origin cursor/andre-ar-webhook-2ea1
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+open-ar analyze /path/to/your-track.wav --goal playlist --comps examples/permission_cleared_catalog.example.json
+env -u GROK_BOT_WEBHOOK_URL -u GROK_BOT_WEBHOOK_KEY open-ar andre share /path/to/your-track.wav --goal playlist --comps examples/permission_cleared_catalog.example.json --marketing examples/marketing_notes.example.json --json handoff.json
+```
+
+Analyze should print measurements from that run, then sounds similar, good song, currently popular, and marketing notes on their own lines. Sounds similar is `ok` only for catalog rows with `permission_cleared: true` and `measurement_source: open_ar` when the file is `kind: verified` and `verified: true`. The example lists AcousticBrainz, Essentia, uncleared, and non-UUID rows as held, with the existing reasons. Seed Artist names are not recommendations. Until you replace the placeholder features, a match is against that placeholder, not a real recording. Good song is `rated` only where a reference has all three 1–5 scores and a rater. Currently popular stays `unavailable` with an empty item list. Marketing notes are `supplied` with `source: local_notes` when you pass `--marketing`, and `unavailable` when you do not. The `env -u` share writes `handoff.json` and does not post: contract `open-ar.andre.v2`, `zz_end` of `complete`, mastering `approved: false` and `rendered: false`, target -14 LUFS, and no audio bytes. It exits 2.
+
+Similarity to real songs still needs your own permission-cleared WAVs, measured with this package, plus your ratings. Marketing notes are local. They are not Soundcharts.
+
 ## Andre · A&R
 
 [Andre · A&R](https://docs.x.ai/grok-bot/skills-routines-and-automations) is Travis Singletary's existing Grok Bot (`9a93499d-e565-47e0-95c1-fd19aceba940`). Open A&R can hand him a measured brief only through a **routine webhook**, which is the documented way to start a Bot with a JSON body. The bot id is identity. It is not a URL, and this repo does not call the xAI model API or any private gateway.
@@ -83,7 +128,7 @@ open-ar andre share track.wav --goal playlist
 open-ar andre share a.wav b.wav c.wav --goal lead_single --json handoff.json
 ```
 
-`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body is contract `open-ar.andre.v2`: labeled measurements, comps for **sounds similar**, one document-level **good song** rating block, one document-level **currently popular** block, gaps, plays, the album sequence, and trim blocks. A null measurement stays in the JSON with a note and is listed under `missing`. `zz_end` is `complete` only on a sealed document. The client does not slice the request. If validation fails, or the sealed body is over 96 KiB, nothing is posted. Required sections stay in the document either way.
+`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body is contract `open-ar.andre.v2`: labeled measurements, comps for **sounds similar**, one document-level **good song** rating block, one document-level **currently popular** block, one document-level **marketing notes** block, gaps, plays, the album sequence, and trim blocks. A null measurement stays in the JSON with a note and is listed under `missing`. `zz_end` is `complete` only on a sealed document. The client does not slice the request. If validation fails, or the sealed body is over 96 KiB, nothing is posted. Required sections stay in the document either way. Long marketing notes are shortened so one track, and an eight-track album with a small reference library, can still seal. The cap stays 96 KiB.
 
 The earlier handoff nested full fixture comps inside each track and put sequence and trims after that block. A summary that stopped mid-comps could hide the tail even though the POST sent the whole object. The response reader still limits itself to 4 KiB; that limit is the reply, not the request.
 
@@ -114,6 +159,7 @@ A template for the variable names is in `.env.example`. Leave the values empty i
 3. **Local audio first.** Compatible references are WAVs measured by this package. Spotify audio-features are not a source.
 4. **Similarity needs permission and the same meter.** The catalog must be `kind: verified` and `verified: true`, and each reference needs `permission_cleared: true` and `measurement_source: open_ar`. Fixtures stay fixtures. AcousticBrainz numbers stay out of the distance.
 5. **Name the unit.** RMS relative to the file peak is not LUFS. An onset peak is not a hook. Proxy scores say so. Popularity is unavailable.
+6. **Marketing notes are local.** They are their own handoff lane. They are not a chart, a stream count, or Soundcharts, and they do not change fit.
 
 ## Library API
 

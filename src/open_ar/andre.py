@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from open_ar import __version__
 from open_ar.comps import POPULARITY_UNAVAILABLE, build_questions
 from open_ar.edits import propose_trims, sequence_album
+from open_ar.marketing import MARKETING_FIELDS, marketing_lane, unavailable_marketing
 from open_ar.schema import ARBrief
 
 BOT_NAME = "Andre · A&R"
@@ -61,7 +62,8 @@ CONTEXT_NOTES = [
     "workflow.mastering.rendered is false. Do not master until Travis approves.",
     "sounds_similar is comps: distance to permission-cleared Open A&R references. It is not a quality score.",
     "good_song is a 1-5 listener rating of drum impact, hook, and conviction. It is once per document.",
-    "currently_popular is unavailable. Soundcharts is paid and is not called. A catalog popularity number is ignored.",
+    "currently_popular is unavailable. Soundcharts is paid and is not called. A popularity number in any file is ignored.",
+    "marketing_notes is local_notes supplied by hand. It is not similarity, not a listener rating, and not current popularity.",
 ]
 
 _MEASUREMENTS = (
@@ -410,11 +412,20 @@ def _track_record(brief: ARBrief, beats: list[float], beat_grid: str) -> dict:
     }
 
 
-def _missing_fields(tracks: list[dict], good_song: dict, currently_popular: dict) -> list[dict]:
+def _missing_fields(
+    tracks: list[dict],
+    good_song: dict,
+    currently_popular: dict,
+    marketing_notes: dict,
+) -> list[dict]:
     missing: list[dict] = []
     for lane, block in (("good_song", good_song), ("currently_popular", currently_popular)):
         if block.get("status") not in {"ok", "rated"}:
             missing.append({"field": lane, "reason": block.get("reason") or "unavailable"})
+    if marketing_notes.get("status") != "supplied":
+        missing.append(
+            {"field": "marketing_notes", "reason": marketing_notes.get("reason") or "unavailable"}
+        )
     for index, track in enumerate(tracks):
         for name, measurement in track["measurements"].items():
             if measurement.get("value") is None:
@@ -477,6 +488,7 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
         "album_sequence",
         "good_song",
         "currently_popular",
+        "marketing_notes",
         "comparison_held",
         "workflow",
         "zz_end",
@@ -554,8 +566,26 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
         if "Seed Artist" in blob:
             errors.append(f"tracks[{index}].fixture_comp")
     popular = payload.get("currently_popular") if isinstance(payload.get("currently_popular"), dict) else {}
-    if popular.get("status") != "unavailable" or popular.get("items") or not popular.get("reason"):
+    if (
+        set(popular) - {"status", "reason", "source", "items"}
+        or popular.get("status") != "unavailable"
+        or popular.get("items") != []
+        or not popular.get("reason")
+    ):
         errors.append("currently_popular")
+    marketing = payload.get("marketing_notes") if isinstance(payload.get("marketing_notes"), dict) else {}
+    marketing_fields = ("status", "reason", "source", *MARKETING_FIELDS)
+    if any(field not in marketing for field in marketing_fields) or set(marketing) - set(marketing_fields):
+        errors.append("marketing_notes")
+    elif marketing.get("status") == "unavailable":
+        if not marketing.get("reason") or marketing.get("source") is not None:
+            errors.append("marketing_notes.unavailable")
+        elif any(marketing.get(field) for field in MARKETING_FIELDS):
+            errors.append("marketing_notes.unavailable")
+    elif marketing.get("status") != "supplied" or marketing.get("source") != "local_notes":
+        errors.append("marketing_notes.status")
+    elif any(not isinstance(marketing.get(field), str) for field in MARKETING_FIELDS):
+        errors.append("marketing_notes.fields")
     good = payload.get("good_song") if isinstance(payload.get("good_song"), dict) else {}
     if "status" not in good or "items" not in good:
         errors.append("good_song")
@@ -578,10 +608,85 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
     return errors
 
 
+def _shared_marketing(briefs: list[ARBrief]) -> dict:
+    if not briefs:
+        return unavailable_marketing()
+    lanes = [marketing_lane(brief.marketing_notes) for brief in briefs]
+    first = lanes[0]
+    if all(lane == first for lane in lanes):
+        return first
+    return unavailable_marketing(
+        "Marketing notes differ across tracks. Pass one --marketing file for the document."
+    )
+
+
+def _sealed_len(payload: dict) -> int:
+    return len(posted_bytes(seal_handoff(payload)))
+
+
+def _longest_prefix(payload: dict, lane: dict, field: str, text: str) -> int:
+    lo = 0
+    hi = len(text)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        lane[field] = text[:mid]
+        if _sealed_len(payload) <= MAX_HANDOFF_UTF8_BYTES:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    lane[field] = text[:best]
+    return best
+
+
+_SHRINK_ORDER = ("notes", "playlist_pitch", "radio", "campaign", "audience", "supplied_by")
+_SHORTEN_REASON = "Notes were shortened so the sealed handoff stays within 96 KiB."
+
+
+def _shrink_marketing_notes(payload: dict) -> dict:
+    """Shorten marketing text when that is what would cross 96 KiB.
+
+    Required sections stay in the document. If the tracks alone exceed the cap,
+    the notes are left as written and validate_handoff refuses the whole body.
+    """
+    lane = payload.get("marketing_notes")
+    if not isinstance(lane, dict) or _sealed_len(payload) <= MAX_HANDOFF_UTF8_BYTES:
+        return payload
+    originals = {
+        field: lane.get(field) if isinstance(lane.get(field), str) else "" for field in _SHRINK_ORDER
+    }
+    for field in _SHRINK_ORDER:
+        lane[field] = ""
+    if _sealed_len(payload) > MAX_HANDOFF_UTF8_BYTES:
+        for field, text in originals.items():
+            lane[field] = text
+        return payload
+    for field, text in originals.items():
+        lane[field] = text
+    previous_reason = lane.get("reason")
+    if lane.get("status") == "supplied":
+        lane["reason"] = _SHORTEN_REASON
+    for field in _SHRINK_ORDER:
+        if _sealed_len(payload) <= MAX_HANDOFF_UTF8_BYTES:
+            break
+        _longest_prefix(payload, lane, field, originals[field])
+    if _sealed_len(payload) <= MAX_HANDOFF_UTF8_BYTES:
+        return payload
+    lane["reason"] = previous_reason if isinstance(previous_reason, str) or previous_reason is None else None
+    for field in _SHRINK_ORDER:
+        if _sealed_len(payload) <= MAX_HANDOFF_UTF8_BYTES:
+            break
+        current = lane.get(field) if isinstance(lane.get(field), str) else ""
+        _longest_prefix(payload, lane, field, current)
+    return payload
+
+
 def build_handoff(
     briefs: list[ARBrief],
     beat_times_by_track: Mapping[str, list[float]] | None = None,
     beat_grid_by_track: Mapping[str, str] | None = None,
+    marketing_notes: Mapping[str, object] | None = None,
 ) -> dict:
     """Build the sealed JSON body. Does not write audio or open a connection."""
     beats = beat_times_by_track or {}
@@ -617,6 +722,10 @@ def build_handoff(
     if briefs and not shared_good:
         for brief, track in zip(briefs, tracks, strict=True):
             track["questions"]["good_song"] = _questions(brief)["good_song"]
+    if marketing_notes is not None:
+        lane = marketing_lane(marketing_notes)
+    else:
+        lane = _shared_marketing(briefs)
     payload = {
         "contract": CONTRACT,
         "generated_by": f"open-ar {__version__}",
@@ -638,11 +747,16 @@ def build_handoff(
         "album_sequence": sequence_album(sequence_input),
         "good_song": good_song,
         "currently_popular": currently_popular,
+        "marketing_notes": lane,
         "comparison_held": held,
-        "missing": _missing_fields(tracks, good_song, currently_popular),
+        "missing": [],
         "context_notes": list(CONTEXT_NOTES),
         "zz_end": "complete",
     }
+    payload["missing"] = _missing_fields(tracks, good_song, currently_popular, lane)
+    payload["complete"] = True
+    payload = _shrink_marketing_notes(payload)
+    payload["missing"] = _missing_fields(tracks, good_song, currently_popular, payload["marketing_notes"])
     payload["complete"] = True
     return seal_handoff(payload)
 

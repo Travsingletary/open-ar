@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from open_ar.marketing import unavailable_marketing
+
 
 class Goal(str, Enum):
     playlist = "playlist"
@@ -141,6 +143,7 @@ class ARBrief(BaseModel):
     comps_reason: str | None = None
     comparison_held: list[dict[str, Any]] = Field(default_factory=list)
     questions: dict[str, Any] = Field(default_factory=dict)
+    marketing_notes: dict[str, Any] = Field(default_factory=unavailable_marketing)
     fit: FitScore
     gaps: list[Gap]
     plays: list[Play]
@@ -148,6 +151,7 @@ class ARBrief(BaseModel):
         "Fit uses measured signals and, only when configured, a verified comparison "
         "catalog. Bundled seed comps are fixtures, not artist or chart recommendations. "
         "An onset peak is not a verified hook. RMS relative to the file peak is not LUFS. "
+        "Local marketing notes, when supplied, are not popularity and do not change fit. "
         "This is not a verdict on artistic quality."
     )
 
