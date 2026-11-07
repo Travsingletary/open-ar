@@ -442,7 +442,7 @@ def _profile_brief(index: int) -> ARBrief:
 
 
 def test_one_track_fits_and_eight_are_refused_without_dropping_sections():
-    """The sender does not slice. A batch over 24 KiB is refused whole."""
+    """The sender does not slice. A batch over the byte cap is refused whole."""
     one = build_handoff(
         [_profile_brief(0)],
         {"/tmp/open-ar-track-0.wav": [8.0, 140.0, 142.8]},

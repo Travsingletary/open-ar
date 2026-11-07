@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from open_ar.andre import build_handoff, validate_handoff
 from open_ar.brief import build_brief
 from open_ar.schema import Goal
 
@@ -89,6 +90,14 @@ def test_ratings_do_not_change_similarity_and_popularity_stays_empty(tmp_path: P
     assert low_brief.questions["currently_popular"]["items"] == []
     assert "99" not in json.dumps(low_brief.questions["currently_popular"])
     assert "Soundcharts" in low_brief.questions["currently_popular"]["reason"]
+    handoff = build_handoff([low_brief])
+    assert validate_handoff(handoff) == []
+    assert handoff["tracks"][0]["questions"]["sounds_similar"]["items_field"] == "comps"
+    assert "good_song" not in handoff["tracks"][0]["questions"]
+    assert handoff["good_song"]["items"][0]["conviction"] == 1
+    assert handoff["currently_popular"]["items"] == []
+    assert "99" not in json.dumps(handoff["currently_popular"])
+    assert handoff["tracks"][0]["comps"]["items"][0]["musicbrainz_recording_mbid"] is None
 
 
 def test_acousticbrainz_and_uncleared_tracks_are_not_similarity_comps(tmp_path: Path):

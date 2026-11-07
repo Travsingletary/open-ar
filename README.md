@@ -83,7 +83,7 @@ open-ar andre share track.wav --goal playlist
 open-ar andre share a.wav b.wav c.wav --goal lead_single --json handoff.json
 ```
 
-`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body is contract `open-ar.andre.v2`: labeled measurements, an explicit comps status, separate `sounds_similar`, `good_song`, and `currently_popular` lanes, gaps, plays, the album sequence, and trim blocks. A null measurement stays in the JSON with a note and is listed under `missing`. `zz_end` is `complete` only on a sealed document. The client does not slice the request. If validation fails, or the sealed body is over 24 KiB, nothing is posted. Required sections stay in the document either way.
+`share` exits `0` when Grok Bot returns 200, `2` when it sent nothing, and `1` when the call failed. It posts once and does not retry. The body is contract `open-ar.andre.v2`: labeled measurements, comps for **sounds similar**, one document-level **good song** rating block, one document-level **currently popular** block, gaps, plays, the album sequence, and trim blocks. A null measurement stays in the JSON with a note and is listed under `missing`. `zz_end` is `complete` only on a sealed document. The client does not slice the request. If validation fails, or the sealed body is over 96 KiB, nothing is posted. Required sections stay in the document either way.
 
 The earlier handoff nested full fixture comps inside each track and put sequence and trims after that block. A summary that stopped mid-comps could hide the tail even though the POST sent the whole object. The response reader still limits itself to 4 KiB; that limit is the reply, not the request.
 
@@ -109,11 +109,11 @@ A template for the variable names is in `.env.example`. Leave the values empty i
 
 ## Design rules
 
-1. **Fit ≠ quality.** Artistic worth is outside this tool’s job.
-2. **Always pair a recommendation with evidence** (comps + gaps).
-3. **Local audio first.** Don’t depend on deprecated Spotify audio-features for new apps.
-4. **Fixture comps stay fixtures.** They are excluded until a catalog is marked `kind: verified` and `verified: true`.
-5. **Name the unit.** RMS relative to the file peak is not LUFS. An onset peak is not a hook. Proxy scores say so.
+1. **Fit is not quality.** A good song is only a listener rating of drum impact, hook, and conviction.
+2. **Keep the three questions apart.** Sounds similar, good song, and currently popular are separate fields.
+3. **Local audio first.** Compatible references are WAVs measured by this package. Spotify audio-features are not a source.
+4. **Similarity needs permission and the same meter.** The catalog must be `kind: verified` and `verified: true`, and each reference needs `permission_cleared: true` and `measurement_source: open_ar`. Fixtures stay fixtures. AcousticBrainz numbers stay out of the distance.
+5. **Name the unit.** RMS relative to the file peak is not LUFS. An onset peak is not a hook. Proxy scores say so. Popularity is unavailable.
 
 ## Library API
 

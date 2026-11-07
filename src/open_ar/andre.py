@@ -28,7 +28,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from open_ar import __version__
-from open_ar.comps import build_questions
+from open_ar.comps import POPULARITY_UNAVAILABLE, build_questions
 from open_ar.edits import propose_trims, sequence_album
 from open_ar.schema import ARBrief
 
@@ -46,7 +46,7 @@ URL_INVALID = "GROK_BOT_WEBHOOK_URL_INVALID"
 TARGET_LUFS = -14
 WEBHOOK_TIMEOUT_SEC = 8.0
 CONTRACT = "open-ar.andre.v2"
-MAX_HANDOFF_UTF8_BYTES = 24 * 1024
+MAX_HANDOFF_UTF8_BYTES = 96 * 1024
 _META_KEYS = ("payload_sha256", "payload_utf8_bytes")
 
 Poster = Callable[[str, str, dict], tuple[int, str]]
@@ -59,6 +59,9 @@ CONTEXT_NOTES = [
     "An onset peak is not a hook. RMS relative to the file peak is not LUFS.",
     "audio_bytes_included is false. Pair a file you already have by SHA-256. No audio URL is included.",
     "workflow.mastering.rendered is false. Do not master until Travis approves.",
+    "sounds_similar is comps: distance to permission-cleared Open A&R references. It is not a quality score.",
+    "good_song is a 1-5 listener rating of drum impact, hook, and conviction. It is once per document.",
+    "currently_popular is unavailable. Soundcharts is paid and is not called. A catalog popularity number is ignored.",
 ]
 
 _MEASUREMENTS = (
@@ -325,6 +328,51 @@ def _questions(brief: ARBrief) -> dict:
     )
 
 
+def _handoff_questions(brief: ARBrief) -> dict:
+    """Similarity stays on the track. Quality and popularity are hoisted once per document."""
+    similar = dict(_questions(brief)["sounds_similar"])
+    similar.pop("items", None)
+    similar.pop("held", None)
+    similar["items_field"] = "comps"
+    return {"sounds_similar": similar}
+
+
+def _document_lanes(briefs: list[ARBrief]) -> tuple[dict, dict, list]:
+    if not briefs:
+        empty = build_questions(
+            catalog_verified=False,
+            catalog_reason="no tracks",
+            tracks=[],
+            matches=[],
+            held=[],
+        )
+        return empty["good_song"], empty["currently_popular"], []
+    questions = [_questions(brief) for brief in briefs]
+    good = questions[0]["good_song"]
+    popular = questions[0]["currently_popular"]
+    held = list(briefs[0].comparison_held)
+    good_same = all(item["good_song"] == good for item in questions)
+    popular_same = all(item["currently_popular"] == popular for item in questions)
+    held_same = all(brief.comparison_held == held for brief in briefs)
+    if not good_same:
+        good = {
+            "status": "unavailable",
+            "reason": "Listener ratings differ across tracks. Each differing track carries its own good_song.",
+            "scale": "1-5 listener rating",
+            "items": [],
+        }
+    if not popular_same:
+        popular = {
+            "status": "unavailable",
+            "reason": POPULARITY_UNAVAILABLE,
+            "source": None,
+            "items": [],
+        }
+    if not held_same:
+        held = []
+    return good, popular, held
+
+
 def _track_record(brief: ARBrief, beats: list[float], beat_grid: str) -> dict:
     path = Path(brief.track_path)
     digest, size = _sha256(path)
@@ -351,7 +399,7 @@ def _track_record(brief: ARBrief, beats: list[float], beat_grid: str) -> dict:
         "goal": brief.goal.value,
         "measurements": _measurements(brief.features),
         "comps": _comps_block(brief),
-        "questions": _questions(brief),
+        "questions": _handoff_questions(brief),
         "fit": {"score": round(brief.fit.score, 4), "rationale": brief.fit.rationale},
         "gaps": [{"code": gap.code, "severity": gap.severity, "message": gap.message} for gap in brief.gaps],
         "plays": [
@@ -362,8 +410,11 @@ def _track_record(brief: ARBrief, beats: list[float], beat_grid: str) -> dict:
     }
 
 
-def _missing_fields(tracks: list[dict]) -> list[dict]:
+def _missing_fields(tracks: list[dict], good_song: dict, currently_popular: dict) -> list[dict]:
     missing: list[dict] = []
+    for lane, block in (("good_song", good_song), ("currently_popular", currently_popular)):
+        if block.get("status") not in {"ok", "rated"}:
+            missing.append({"field": lane, "reason": block.get("reason") or "unavailable"})
     for index, track in enumerate(tracks):
         for name, measurement in track["measurements"].items():
             if measurement.get("value") is None:
@@ -375,16 +426,15 @@ def _missing_fields(tracks: list[dict]) -> list[dict]:
                 )
         if track["comps"]["status"] != "ok":
             missing.append({"field": f"tracks[{index}].comps", "reason": track["comps"]["reason"]})
-        questions = track.get("questions") if isinstance(track.get("questions"), dict) else {}
-        for lane in ("sounds_similar", "good_song", "currently_popular"):
-            block = questions.get(lane) if isinstance(questions.get(lane), dict) else {}
-            if block.get("status") != "ok" and block.get("status") != "rated":
-                missing.append(
-                    {
-                        "field": f"tracks[{index}].questions.{lane}",
-                        "reason": block.get("reason") or "unavailable",
-                    }
-                )
+        similar = (track.get("questions") or {}).get("sounds_similar")
+        if not isinstance(similar, dict) or similar.get("status") not in {"ok", "rated"}:
+            reason = similar.get("reason") if isinstance(similar, dict) else None
+            missing.append(
+                {
+                    "field": f"tracks[{index}].questions.sounds_similar",
+                    "reason": reason or "unavailable",
+                }
+            )
         if track["audio"]["sha256"] is None:
             missing.append({"field": f"tracks[{index}].audio.sha256", "reason": track["audio"]["reason"]})
         for edge in ("intro", "outro"):
@@ -425,6 +475,9 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
         "audio_pairing",
         "tracks",
         "album_sequence",
+        "good_song",
+        "currently_popular",
+        "comparison_held",
         "workflow",
         "zz_end",
     )
@@ -456,18 +509,21 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
             if key not in track:
                 errors.append(f"tracks[{index}].{key}")
         questions = track.get("questions") if isinstance(track.get("questions"), dict) else {}
-        for lane in ("sounds_similar", "good_song", "currently_popular"):
+        similar = questions.get("sounds_similar")
+        if not isinstance(similar, dict) or "status" not in similar or similar.get("items_field") != "comps":
+            errors.append(f"tracks[{index}].questions.sounds_similar")
+        elif similar["status"] not in {"ok", "unavailable"}:
+            errors.append(f"tracks[{index}].questions.sounds_similar.status")
+        elif similar["status"] == "unavailable" and not similar.get("reason"):
+            errors.append(f"tracks[{index}].questions.sounds_similar.unavailable")
+        for lane in ("good_song", "currently_popular"):
             block = questions.get(lane)
+            if block is None:
+                continue
             if not isinstance(block, dict) or "status" not in block or "items" not in block:
                 errors.append(f"tracks[{index}].questions.{lane}")
-                continue
-            if block["status"] not in {"ok", "rated", "unavailable"}:
-                errors.append(f"tracks[{index}].questions.{lane}.status")
-            if block["status"] == "unavailable" and (not block.get("reason") or block.get("items")):
+            elif block["status"] == "unavailable" and (not block.get("reason") or block.get("items")):
                 errors.append(f"tracks[{index}].questions.{lane}.unavailable")
-        popular = questions.get("currently_popular") if isinstance(questions.get("currently_popular"), dict) else {}
-        if popular.get("status") != "unavailable" or popular.get("items"):
-            errors.append(f"tracks[{index}].questions.currently_popular")
         measurements = track.get("measurements") if isinstance(track.get("measurements"), dict) else {}
         for name in _MEASUREMENTS:
             measurement = measurements.get(name)
@@ -484,15 +540,29 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
             errors.append(f"tracks[{index}].comps.status")
         if comps.get("status") == "unavailable" and (not comps.get("reason") or comps.get("items")):
             errors.append(f"tracks[{index}].comps.unavailable")
+        if isinstance(similar, dict) and similar.get("status") == "ok" and comps.get("status") != "ok":
+            errors.append(f"tracks[{index}].questions.sounds_similar.comps")
+        if isinstance(similar, dict) and similar.get("status") == "unavailable" and comps.get("items"):
+            errors.append(f"tracks[{index}].questions.sounds_similar.comps")
         trims = track.get("trims") if isinstance(track.get("trims"), dict) else {}
         for edge in ("intro", "outro"):
             if edge not in trims:
                 errors.append(f"tracks[{index}].trims.{edge}")
         if trims.get("fade_out") is not False or trims.get("applied") is not False:
             errors.append(f"tracks[{index}].trims.not_applied")
-        blob = json.dumps(track.get("comps")) + json.dumps(track.get("plays"))
+        blob = json.dumps(track.get("comps")) + json.dumps(track.get("plays")) + json.dumps(track.get("questions"))
         if "Seed Artist" in blob:
             errors.append(f"tracks[{index}].fixture_comp")
+    popular = payload.get("currently_popular") if isinstance(payload.get("currently_popular"), dict) else {}
+    if popular.get("status") != "unavailable" or popular.get("items") or not popular.get("reason"):
+        errors.append("currently_popular")
+    good = payload.get("good_song") if isinstance(payload.get("good_song"), dict) else {}
+    if "status" not in good or "items" not in good:
+        errors.append("good_song")
+    elif good.get("status") == "unavailable" and (not good.get("reason") or good.get("items")):
+        errors.append("good_song.unavailable")
+    if not isinstance(payload.get("comparison_held"), list):
+        errors.append("comparison_held")
     raw = canonical_body(payload)
     posted = posted_bytes(payload)
     if len(posted) > MAX_HANDOFF_UTF8_BYTES:
@@ -534,6 +604,19 @@ def build_handoff(
                 "key": brief.features.key,
             }
         )
+    good_song, currently_popular, held = _document_lanes(briefs)
+    shared_good = json.dumps(good_song, sort_keys=True) != json.dumps(
+        {
+            "status": "unavailable",
+            "reason": "Listener ratings differ across tracks. Each differing track carries its own good_song.",
+            "scale": "1-5 listener rating",
+            "items": [],
+        },
+        sort_keys=True,
+    )
+    if briefs and not shared_good:
+        for brief, track in zip(briefs, tracks, strict=True):
+            track["questions"]["good_song"] = _questions(brief)["good_song"]
     payload = {
         "contract": CONTRACT,
         "generated_by": f"open-ar {__version__}",
@@ -553,7 +636,10 @@ def build_handoff(
         "workflow": workflow_policy(),
         "tracks": tracks,
         "album_sequence": sequence_album(sequence_input),
-        "missing": _missing_fields(tracks),
+        "good_song": good_song,
+        "currently_popular": currently_popular,
+        "comparison_held": held,
+        "missing": _missing_fields(tracks, good_song, currently_popular),
         "context_notes": list(CONTEXT_NOTES),
         "zz_end": "complete",
     }
