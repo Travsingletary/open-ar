@@ -1,0 +1,9 @@
+{
+  "campaign": "Write the campaign name you are actually running.",
+  "audience": "Who you want to reach, in your own words.",
+  "playlist_pitch": "The pitch you would send. This is not a chart position.",
+  "radio": "Stations or shows you plan to contact yourself.",
+  "notes": "Hand-written. Not a stream count and not Soundcharts.",
+  "supplied_by": "replace-with-your-name",
+  "source": "local_notes"
+}

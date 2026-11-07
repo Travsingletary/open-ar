@@ -8,24 +8,29 @@ def score_fit(features: AudioFeatures, goal: Goal, comps: list[CompMatch]) -> Fi
     score = 0.5
 
     goal_comps = [c for c in comps if goal.value in c.comp.goal_tags]
-    if goal_comps:
+    if not comps:
+        rationale.append("no verified comparison catalog; fit does not use reference tracks")
+    elif goal_comps:
         avg_dist = sum(c.distance for c in goal_comps[:3]) / max(len(goal_comps[:3]), 1)
         proximity = max(0.0, 1.0 - avg_dist)
         score = 0.35 + 0.65 * proximity
         rationale.append(f"avg distance to top {goal.value} comps: {avg_dist:.3f}")
     else:
-        rationale.append(f"no seed comps tagged {goal.value}; using global neighbors")
+        rationale.append(f"verified catalog has no tracks tagged {goal.value}")
 
     if goal in (Goal.playlist, Goal.lead_single):
         if 150 <= features.duration_sec <= 210:
             score += 0.05
             rationale.append("runtime in common streaming single window")
-        if features.hook_onset_sec <= 25:
-            score += 0.05
-            rationale.append("hook arrives early enough for skip risk")
+        if features.hook_verified and features.hook_onset_sec is not None:
+            if features.hook_onset_sec <= 25:
+                score += 0.05
+                rationale.append("verified hook arrives within 25s")
+            else:
+                score -= 0.08
+                rationale.append("verified hook arrives after 25s")
         else:
-            score -= 0.08
-            rationale.append("hook arrives late for playlist skip windows")
+            rationale.append("hook timing unavailable; onset peak is not scored as a hook")
 
     if goal == Goal.club:
         if features.danceability >= 0.7 and features.energy >= 0.7:
@@ -56,12 +61,30 @@ def score_fit(features: AudioFeatures, goal: Goal, comps: list[CompMatch]) -> Fi
 def detect_gaps(features: AudioFeatures, goal: Goal, comps: list[CompMatch]) -> list[Gap]:
     gaps: list[Gap] = []
 
-    if goal in (Goal.playlist, Goal.lead_single) and features.hook_onset_sec > 30:
+    if (
+        goal in (Goal.playlist, Goal.lead_single)
+        and features.hook_verified
+        and features.hook_onset_sec is not None
+        and features.hook_onset_sec > 30
+    ):
         gaps.append(
             Gap(
                 code="late_hook",
                 severity="high",
-                message=f"Hook proxy at {features.hook_onset_sec:.0f}s — cut a cold open or move motif earlier.",
+                message=f"Verified hook at {features.hook_onset_sec:.0f}s — consider moving the motif earlier.",
+            )
+        )
+    elif goal in (Goal.playlist, Goal.lead_single) and not features.hook_verified:
+        peak = features.novelty_peak_sec
+        where = f" at {peak:.1f}s" if peak is not None else ""
+        gaps.append(
+            Gap(
+                code="hook_unverified",
+                severity="high",
+                message=(
+                    f"No verified hook. Strongest onset peak{where} is not a hook "
+                    "and is not a cut point."
+                ),
             )
         )
 
@@ -79,7 +102,10 @@ def detect_gaps(features: AudioFeatures, goal: Goal, comps: list[CompMatch]) -> 
             Gap(
                 code="low_club_energy",
                 severity="high",
-                message="Energy below club comps — remix with heavier low-end / percussion, or retarget.",
+                message=(
+                    f"Energy proxy {features.energy:.2f} is below 0.65. "
+                    "The proxy is mean RMS times 8, clipped at 1. It is not LUFS."
+                ),
             )
         )
 
@@ -92,12 +118,20 @@ def detect_gaps(features: AudioFeatures, goal: Goal, comps: list[CompMatch]) -> 
             )
         )
 
-    if comps and comps[0].distance > 0.55:
+    if not comps:
+        gaps.append(
+            Gap(
+                code="comps_unavailable",
+                severity="info",
+                message="No verified comparison catalog. Fixture examples are not recommendations.",
+            )
+        )
+    elif comps[0].distance > 0.55:
         gaps.append(
             Gap(
                 code="weak_comp_neighborhood",
                 severity="low",
-                message="Far from seed comps — either unique (good for cult) or mis-tagged goal; expand your catalog.",
+                message="Far from the supplied comparison tracks. That is distance, not a chart position.",
             )
         )
 
@@ -115,16 +149,26 @@ def build_plays(
     gap_codes = {g.code for g in gaps}
     top = comps[:3]
     pitch_list = [f"{c.comp.title} — {c.comp.artist} ({c.comp.outcome})" for c in top]
+    comp_action = (
+        f"Sounds-similar references, not a quality or popularity ranking: {', '.join(pitch_list)}."
+        if pitch_list
+        else "No compatible permission-cleared comparison library. Do not cite fixture artists."
+    )
 
     if goal in (Goal.playlist, Goal.lead_single):
         if "late_hook" in gap_codes or "long_runtime" in gap_codes:
+            cut_action = (
+                "Cut a streaming edit under ~3:30. Hook placement is unverified, so this does not mark a cut."
+                if not features.hook_verified
+                else "Cut a streaming edit: verified hook by ~0:20, total under ~3:30."
+            )
             plays.append(
                 Play(
                     primary=True,
-                    title="Hold wide release — ship content cut first",
+                    title="Hold wide release — ship a shorter cut first",
                     actions=[
-                        "Export a 12–20s hook clip for Reels/TikTok/Shorts before full release.",
-                        "Cut a streaming edit: hook by ~0:20, total under ~3:30.",
+                        "Duration or a verified late hook is the reason. Do not cut at an onset peak.",
+                        cut_action,
                         "Re-run open-ar on the edit before pitching.",
                     ],
                     evidence=[g.message for g in gaps if g.code in {"late_hook", "long_runtime"}],
@@ -141,15 +185,28 @@ def build_plays(
                     evidence=["Fit score under playlist pressure with structure gaps."],
                 )
             )
+        elif "hook_unverified" in gap_codes:
+            plays.append(
+                Play(
+                    primary=True,
+                    title="Hook unverified — do not trim to the onset peak",
+                    actions=[
+                        "No intro cut is proposed. An onset peak is not a hook mark.",
+                        comp_action,
+                        "Add a verified hook mark before asking for an edit.",
+                    ],
+                    evidence=[g.message for g in gaps if g.code == "hook_unverified"],
+                )
+            )
         else:
             plays.append(
                 Play(
                     primary=True,
-                    title="Release as lead / playlist pitch",
+                    title="Release path from measured signals",
                     actions=[
-                        "Package one-sheet with mood, BPM, key, and 3 comps.",
-                        f"Pitch archetype comps: {', '.join(pitch_list) if pitch_list else 'add your own comps'}.",
-                        "Schedule content drops that lead with the hook, not the intro.",
+                        "Package one-sheet with the measured tempo estimate, key estimate, and LUFS if present.",
+                        comp_action,
+                        "Do not schedule the pitch around an unverified onset peak.",
                     ],
                     evidence=fit.rationale[:3],
                 )
@@ -187,7 +244,7 @@ def build_plays(
                     title="DJ service + club playlist push",
                     actions=[
                         "Deliver extended mix + radio edit.",
-                        f"Reference rotations near: {', '.join(pitch_list)}.",
+                        comp_action,
                         "Seed with 10–20 DJs before DSP push.",
                     ],
                     evidence=fit.rationale[:3],

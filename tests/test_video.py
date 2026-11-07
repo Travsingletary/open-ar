@@ -86,6 +86,14 @@ def test_video_playbook_short_form_wants_vertical():
     assert fit.score < 0.7
 
 
+def test_video_comps_keep_held_references_out_of_distance(tmp_path: Path):
+    mp4 = _make_test_mp4(tmp_path / "gated.mp4", seconds=6.0)
+    catalog = Path(__file__).resolve().parents[1] / "examples" / "permission_cleared_catalog.example.json"
+    brief = build_video_brief(mp4, goal=VideoGoal.youtube_mv, comps_path=catalog)
+    assert [match.comp.id for match in brief.audio_comps] == ["local-ref-placeholder"]
+    assert "Seed Artist" not in brief.model_dump_json()
+
+
 def test_analyze_video_brief(tmp_path: Path):
     mp4 = _make_test_mp4(tmp_path / "mv.mp4", seconds=6.0)
     brief = build_video_brief(mp4, goal=VideoGoal.youtube_mv)

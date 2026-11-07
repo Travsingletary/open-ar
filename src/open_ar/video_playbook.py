@@ -27,12 +27,14 @@ def score_video_fit(video: VideoFeatures, audio: AudioFeatures, goal: VideoGoal)
         else:
             score -= 0.1
             rationale.append("opening looks static — YouTube drop-off risk in first 15s")
-        if video.audio_hook_visual_sync >= 0.6:
+        if video.audio_sync_basis == "verified_hook" and video.audio_hook_visual_sync >= 0.6:
             score += 0.08
-            rationale.append("visual peak/cut near audio hook")
-        else:
+            rationale.append("visual peak/cut near a verified audio hook")
+        elif video.audio_sync_basis == "verified_hook":
             score -= 0.06
-            rationale.append("picture peak is off the audio hook — retime cuts to chorus")
+            rationale.append("picture peak is off the verified audio hook")
+        else:
+            rationale.append("hook sync not scored; an onset peak is not a verified hook")
 
     elif goal == VideoGoal.short_form:
         if video.aspect == "vertical":
@@ -47,9 +49,11 @@ def score_video_fit(video: VideoFeatures, audio: AudioFeatures, goal: VideoGoal)
         else:
             score -= 0.12
             rationale.append("first 3s too quiet visually for short-form")
-        if audio.hook_onset_sec <= 12:
+        if audio.hook_verified and audio.hook_onset_sec is not None and audio.hook_onset_sec <= 12:
             score += 0.05
-            rationale.append("audio hook early enough to land in a 15–30s cut")
+            rationale.append("verified audio hook is early enough to land in a 15–30s cut")
+        elif not audio.hook_verified:
+            rationale.append("hook timing unavailable for the short-form cut")
 
     elif goal == VideoGoal.premiere:
         if video.duration_sec >= 150:
@@ -104,15 +108,25 @@ def detect_video_gaps(video: VideoFeatures, audio: AudioFeatures, goal: VideoGoa
             )
         )
 
-    if video.audio_hook_visual_sync < 0.45:
+    if video.audio_sync_basis == "verified_hook" and video.audio_hook_visual_sync < 0.45:
+        hook_at = audio.hook_onset_sec if audio.hook_onset_sec is not None else 0.0
         gaps.append(
             Gap(
                 code="hook_picture_mismatch",
                 severity="medium",
                 message=(
-                    f"Audio hook ~{audio.hook_onset_sec:.0f}s vs peak picture ~{video.peak_visual_sec:.0f}s "
-                    "— align the visual hit to the chorus."
+                    f"Verified audio hook ~{hook_at:.0f}s vs peak picture ~{video.peak_visual_sec:.0f}s."
                 ),
+            )
+        )
+    elif video.audio_sync_basis != "verified_hook":
+        peak = audio.novelty_peak_sec
+        where = f" Onset peak at {peak:.1f}s is not a hook." if peak is not None else ""
+        gaps.append(
+            Gap(
+                code="hook_unverified",
+                severity="info",
+                message=f"Picture sync was not scored against a hook.{where}",
             )
         )
 
@@ -139,9 +153,18 @@ def detect_video_gaps(video: VideoFeatures, audio: AudioFeatures, goal: VideoGoa
 
 def suggest_clip_windows(video: VideoFeatures, audio: AudioFeatures) -> list[dict]:
     """Suggest short-form windows anchored on hook / peak visual."""
-    hook = audio.hook_onset_sec
+    anchor, basis = audio.timing_anchor()
     peak = video.peak_visual_sec
-    center = hook if abs(hook - peak) < 8 else peak
+    if anchor is None:
+        center = peak
+        anchor_note = "hook unavailable"
+    else:
+        center = anchor if abs(anchor - peak) < 8 else peak
+        anchor_note = (
+            f"verified hook {anchor:.0f}s"
+            if basis == "verified_hook"
+            else f"onset peak {anchor:.0f}s (not a verified hook)"
+        )
     windows = []
     for length, label in ((15.0, "15s short"), (30.0, "30s short"), (60.0, "1-min cut")):
         start = max(0.0, center - length * 0.35)
@@ -152,17 +175,17 @@ def suggest_clip_windows(video: VideoFeatures, audio: AudioFeatures) -> list[dic
                 "label": label,
                 "start_sec": round(start, 2),
                 "end_sec": round(end, 2),
-                "why": f"centered near audio hook ({hook:.0f}s) / peak picture ({peak:.0f}s)",
+                "why": f"centered near {anchor_note} / peak picture ({peak:.0f}s)",
             }
         )
     # Thumbnail / still suggestion
-    thumb_t = peak if peak > 1 else max(hook, 3.0)
+    thumb_t = peak if peak > 1 else max(anchor or 0.0, 3.0)
     windows.append(
         {
             "label": "thumbnail still",
             "start_sec": round(thumb_t, 2),
             "end_sec": round(thumb_t, 2),
-            "why": "highest visual motion / hook-adjacent frame for CTR tests",
+            "why": "highest visual motion. Not a verified hook frame.",
         }
     )
     return windows

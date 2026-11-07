@@ -1,0 +1,4 @@
+date,source,metric,value,denominator,denominator_missing
+2026-01-05,google_trends_export,search_interest,40,,Google Trends index has no impression denominator
+,google_trends_export,search_interest,55,,Google Trends index has no impression denominator
+2026-01-12,google_trends_export,search_interest,55,,Google Trends index has no impression denominator

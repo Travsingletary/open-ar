@@ -13,3 +13,6 @@ build/
 .data/
 .coverage
 htmlcov/
+.env
+.env.*
+!.env.example

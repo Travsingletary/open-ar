@@ -1,6 +1,8 @@
 {
   "version": "0.1.0",
-  "note": "Synthetic comps for local MVP demos. Replace with your own labeled catalog.",
+  "kind": "fixture",
+  "verified": false,
+  "note": "Synthetic fixture catalog. Not real artists, charts, or outcomes. Excluded from production recommendations.",
   "tracks": [
     {
       "id": "comp-playlist-01",

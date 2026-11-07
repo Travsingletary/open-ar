@@ -5,6 +5,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from open_ar.evidence import unavailable_attention
+from open_ar.marketing import unavailable_marketing
+
 
 class Goal(str, Enum):
     playlist = "playlist"
@@ -30,10 +33,40 @@ class AudioFeatures(BaseModel):
     acousticness: float = Field(ge=0.0, le=1.0)
     speechiness: float = Field(ge=0.0, le=1.0)
     dynamic_range: float = Field(ge=0.0, le=1.0)
-    hook_onset_sec: float
-    loudness_db: float
+    # None unless a hook was marked by something other than an onset peak.
+    hook_onset_sec: float | None = None
+    hook_verified: bool = False
+    novelty_peak_sec: float | None = None
+    # Mean of per-frame RMS relative to this file's own peak RMS. Not LUFS.
+    loudness_db: float | None = None
+    rms_rel_peak_db: float | None = None
+    mean_rms_dbfs: float | None = None
+    energy_saturated: bool = False
+    integrated_lufs: float | None = None
+    lufs_channels: int | None = None
+    lufs_note: str | None = None
+    tempo_octave_ambiguous: bool = True
+    beat_interval_regularity: float | None = None
+    key_margin: float | None = None
+    mode_margin: float | None = None
     key: str | None = None
     mode: str | None = None
+
+    def timing_anchor(self) -> tuple[float | None, str]:
+        if self.hook_verified and self.hook_onset_sec is not None:
+            return self.hook_onset_sec, "verified_hook"
+        if self.novelty_peak_sec is not None:
+            return self.novelty_peak_sec, "onset_peak"
+        return None, "unavailable"
+
+
+class SongRatings(BaseModel):
+    """Listener ratings. These are not acoustic measurements and not popularity."""
+
+    drum_impact: int | None = Field(default=None, ge=1, le=5)
+    hook: int | None = Field(default=None, ge=1, le=5)
+    conviction: int | None = Field(default=None, ge=1, le=5)
+    rater: str = ""
 
 
 class CompTrack(BaseModel):
@@ -45,6 +78,18 @@ class CompTrack(BaseModel):
     outcome: str
     features: AudioFeatures
     notes: str = ""
+    musicbrainz_recording_mbid: str | None = None
+    measurement_source: str = "unspecified"
+    permission_cleared: bool = False
+    # Rights note. An empty note keeps the row out of similarity distance.
+    permission_note: str = ""
+    # Must equal open_ar.features.FEATURE_SCHEMA_VERSION for a similarity comp.
+    feature_version: str | None = None
+    # "extracted" means this package measured a file. "hand_typed" is not a comp.
+    produced_by: str = ""
+    # AcousticBrainz and other off-scale measurements. find_comps does not read this.
+    historical: dict[str, Any] | None = None
+    ratings: SongRatings | None = None
 
 
 class CompMatch(BaseModel):
@@ -86,6 +131,7 @@ class VideoFeatures(BaseModel):
     opening_3s_energy: float = Field(ge=0.0, le=1.0)
     opening_15s_energy: float = Field(ge=0.0, le=1.0)
     audio_hook_visual_sync: float = Field(ge=0.0, le=1.0)
+    audio_sync_basis: str = "unspecified"
     scene_cut_times_sec: list[float] = Field(default_factory=list)
 
 
@@ -96,17 +142,26 @@ class VideoFitScore(BaseModel):
 
 
 class ARBrief(BaseModel):
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     track_path: str
     goal: Goal
     features: AudioFeatures
     comps: list[CompMatch]
+    comps_status: str = "unavailable"
+    comps_reason: str | None = None
+    comparison_held: list[dict[str, Any]] = Field(default_factory=list)
+    questions: dict[str, Any] = Field(default_factory=dict)
+    marketing_notes: dict[str, Any] = Field(default_factory=unavailable_marketing)
+    attention_evidence: dict[str, Any] = Field(default_factory=unavailable_attention)
     fit: FitScore
     gaps: list[Gap]
     plays: list[Play]
     disclaimer: str = (
-        "This is a fit-and-strategy brief against comps and measurable audio "
-        "signals — not a verdict on artistic quality."
+        "Fit uses measured signals and, only when configured, a verified comparison "
+        "catalog. Bundled seed comps are fixtures, not artist or chart recommendations. "
+        "An onset peak is not a verified hook. RMS relative to the file peak is not LUFS. "
+        "Local marketing notes, when supplied, are not popularity and do not change fit. "
+        "This is not a verdict on artistic quality."
     )
 
     def to_pretty_dict(self) -> dict[str, Any]:
