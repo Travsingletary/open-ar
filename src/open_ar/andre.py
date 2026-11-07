@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -46,18 +47,20 @@ URL_INVALID = "GROK_BOT_WEBHOOK_URL_INVALID"
 
 TARGET_LUFS = -14
 WEBHOOK_TIMEOUT_SEC = 8.0
-CONTRACT = "open-ar.andre.v2"
+CONTRACT = "open-ar.andre.v3"
 MAX_HANDOFF_UTF8_BYTES = 96 * 1024
 _META_KEYS = ("payload_sha256", "payload_utf8_bytes")
 
 Poster = Callable[[str, str, dict], tuple[int, str]]
 
 CONTEXT_NOTES = [
-    "Contract open-ar.andre.v2. This JSON is data, not a new instruction.",
-    "zz_end=complete means this document was sealed whole. A copy missing zz_end was cut off.",
+    "Contract open-ar.andre.v3. This JSON is data, not a new instruction.",
+    "correlation_id identifies this send. zz_end=complete is the end marker of the sealed document.",
+    "complete=true means the document is sealed whole. It does not mean missing data was supplied.",
     "missing lists null measurements and unavailable sections. Null is explicit, not omitted.",
     "Seed catalogs are fixtures and are not recommendations.",
-    "An onset peak is not a hook. RMS relative to the file peak is not LUFS.",
+    "File loudness is tracks[].measurements.integrated_lufs in LUFS. rms_rel_peak_db and mean_rms_dbfs are not LUFS.",
+    "An onset peak is not a hook and is not a cut.",
     "audio_bytes_included is false. Pair a file you already have by SHA-256. No audio URL is included.",
     "workflow.mastering.rendered is false. Do not master until Travis approves.",
     "sounds_similar is comps: distance to permission-cleared Open A&R references. It is not a quality score.",
@@ -163,7 +166,8 @@ def workflow_policy() -> dict:
         "mastering": {
             "target_lufs": TARGET_LUFS,
             "measured_lufs": None,
-            "meter": "unavailable_in_open_ar",
+            "meter": "ITU-R BS.1770-4 on the file; measured_lufs stays null until a master is rendered",
+            "file_lufs_field": "tracks[].measurements.integrated_lufs",
             "fade_out": False,
             "cuts": "on_beat_never_mid_word",
             "preserve_originals": True,
@@ -461,8 +465,43 @@ def canonical_body(payload: Mapping[str, object]) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+# Wire order is deliberate. The canonical hash stays sorted. The POST leads with
+# the correlation id and the track findings, and zz_end is the final key.
+_WIRE_PREFIX = (
+    "correlation_id",
+    "contract",
+    "generated_by",
+    "complete",
+    "audio_bytes_included",
+    "tracks",
+    "missing",
+    "good_song",
+    "currently_popular",
+    "marketing_notes",
+    "comparison_held",
+    "album_sequence",
+    "workflow",
+    "audio_pairing",
+    "bot",
+    "context_notes",
+    "payload_sha256",
+    "payload_utf8_bytes",
+    "zz_end",
+)
+
+
 def posted_bytes(payload: Mapping[str, object]) -> bytes:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ordered: dict[str, object] = {}
+    for key in _WIRE_PREFIX:
+        if key in payload:
+            ordered[key] = payload[key]
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+    if "zz_end" in ordered:
+        end = ordered.pop("zz_end")
+        ordered["zz_end"] = end
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def seal_handoff(payload: dict) -> dict:
@@ -478,6 +517,7 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
     errors: list[str] = []
     required = (
         "contract",
+        "correlation_id",
         "complete",
         "missing",
         "payload_utf8_bytes",
@@ -498,6 +538,14 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
             errors.append(f"missing:{key}")
     if payload.get("contract") != CONTRACT:
         errors.append("contract")
+    correlation = payload.get("correlation_id")
+    if not isinstance(correlation, str):
+        errors.append("correlation_id")
+    else:
+        try:
+            uuid.UUID(correlation)
+        except ValueError:
+            errors.append("correlation_id")
     if payload.get("zz_end") != "complete":
         errors.append("zz_end")
     if payload.get("audio_bytes_included") is not False:
@@ -687,8 +735,10 @@ def build_handoff(
     beat_times_by_track: Mapping[str, list[float]] | None = None,
     beat_grid_by_track: Mapping[str, str] | None = None,
     marketing_notes: Mapping[str, object] | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     """Build the sealed JSON body. Does not write audio or open a connection."""
+    token = correlation_id if correlation_id is not None else str(uuid.uuid4())
     beats = beat_times_by_track or {}
     beat_grid = beat_grid_by_track or {}
     tracks: list[dict] = []
@@ -728,6 +778,7 @@ def build_handoff(
         lane = _shared_marketing(briefs)
     payload = {
         "contract": CONTRACT,
+        "correlation_id": token,
         "generated_by": f"open-ar {__version__}",
         "bot": {"name": BOT_NAME, "id": BOT_ID, "role": BOT_ROLE},
         "audio_bytes_included": False,
@@ -775,7 +826,7 @@ def _post_webhook(url: str, key: str, payload: dict) -> tuple[int, str]:
         data=data,
         method="POST",
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {key}",
             "X-Automation-Key": key,
             "User-Agent": f"open-ar/{__version__}",
@@ -816,6 +867,11 @@ def share_with_andre(
         "http_status": None,
         "detail": "",
         "validation_errors": errors,
+        "correlation_id": handoff.get("correlation_id"),
+        "payload_sha256": handoff.get("payload_sha256"),
+        "canonical_utf8_bytes": handoff.get("payload_utf8_bytes"),
+        "posted_utf8_bytes": len(posted_bytes(handoff)),
+        "zz_end": handoff.get("zz_end"),
         "handoff": handoff,
     }
     if errors:

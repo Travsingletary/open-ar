@@ -1,6 +1,7 @@
 import hashlib
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -111,6 +112,14 @@ def test_share_does_not_call_out_when_disconnected(tmp_path: Path):
     assert source.read_bytes() == payload
     assert handoff["contract"] == CONTRACT
     assert handoff["zz_end"] == "complete"
+    uuid.UUID(handoff["correlation_id"])
+    raw = posted_bytes(handoff)
+    assert raw.startswith(b'{"correlation_id":"')
+    assert raw.endswith(b'"zz_end":"complete"}')
+    assert raw.find(b'"tracks"') < raw.find(b'"context_notes"')
+    assert raw.find(b'"integrated_lufs"') < raw.find(b'"rms_rel_peak_db"')
+    assert handoff["workflow"]["mastering"]["measured_lufs"] is None
+    assert handoff["workflow"]["mastering"]["file_lufs_field"] == "tracks[].measurements.integrated_lufs"
     assert validate_handoff(handoff) == []
     assert len(posted_bytes(handoff)) <= MAX_HANDOFF_UTF8_BYTES
     assert handoff["audio_bytes_included"] is False
@@ -235,6 +244,7 @@ class _Recorder(BaseHTTPRequestHandler):
                 "path": self.path,
                 "authorization": self.headers.get("Authorization"),
                 "automation": self.headers.get("X-Automation-Key"),
+                "content_type": self.headers.get("Content-Type"),
                 "body": body,
             }
         )
@@ -275,6 +285,7 @@ def test_webhook_post_is_single_and_does_not_follow_redirects():
         assert server.requests[0]["authorization"] == "Bearer local-key"
         assert server.requests[0]["automation"] == "local-key"
         assert json.loads(server.requests[0]["body"])["contract"] == "open-ar.andre.v1"
+        assert server.requests[0]["content_type"] == "application/json; charset=utf-8"
 
         redirected, _ignored = _post_webhook(f"http://{host}:{port}/redirect", "local-key", {"a": 1})
         assert redirected == 302
@@ -330,6 +341,9 @@ def test_cli_share_leaves_audio_and_exits_disconnected(tmp_path: Path, monkeypat
     assert saved["handoff"]["album_sequence"]
     assert "intro" in track["trims"] and "outro" in track["trims"]
     assert saved["handoff"]["zz_end"] == "complete"
+    uuid.UUID(saved["handoff"]["correlation_id"])
+    assert saved["correlation_id"] == saved["handoff"]["correlation_id"]
+    assert saved["zz_end"] == "complete"
     assert saved["handoff"]["workflow"]["mastering"]["rendered"] is False
     assert saved["handoff"]["audio_bytes_included"] is False
     assert "Seed Artist" not in out.read_text(encoding="utf-8")
@@ -497,6 +511,25 @@ def test_one_track_fits_and_eight_are_refused_without_dropping_sections():
         assert result["delivered"] is False
     else:
         assert errors == []
+
+
+def test_bad_correlation_id_is_not_posted():
+    handoff = build_handoff([_brief("/tmp/missing-open-ar-track.wav")], correlation_id="not-a-uuid")
+    assert "correlation_id" in validate_handoff(handoff)
+    calls = []
+
+    def poster(url, key, body):
+        calls.append(body)
+        return 200, "ok"
+
+    result = share_with_andre(
+        handoff,
+        env={ENV_URL: "https://hooks.example.test/routine", ENV_KEY: "k"},
+        poster=poster,
+    )
+    assert calls == []
+    assert result["attempted"] is False
+    assert result["delivered"] is False
 
 
 def test_invalid_payload_is_not_posted():

@@ -41,7 +41,8 @@ def load_brief(path: str | Path) -> tuple[ARBrief, dict]:
     raw = json.loads(file_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Brief JSON must be an object written by open-ar analyze --json.")
-    if raw.get("contract") == "open-ar.andre.v2":
+    contract = raw.get("contract")
+    if isinstance(contract, str) and contract.startswith("open-ar.andre."):
         raise ValueError("Pass the analyze brief, not the Andre handoff.")
     try:
         brief = ARBrief.model_validate(raw)
