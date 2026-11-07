@@ -12,11 +12,12 @@ from rich.table import Table
 
 from open_ar import __version__
 from open_ar.brief import build_brief
-from open_ar.schema import Goal
+from open_ar.schema import Goal, VideoGoal
+from open_ar.video_brief import build_video_brief
 
 app = typer.Typer(
     name="open-ar",
-    help="Open-source A&R briefs: fit + strategy from local audio analysis.",
+    help="Open-source A&R briefs: fit + strategy from local audio and music-video analysis.",
     no_args_is_help=True,
 )
 console = Console()
@@ -30,6 +31,13 @@ class GoalOption(str, Enum):
     lead_single = "lead_single"
 
 
+class VideoGoalOption(str, Enum):
+    youtube_mv = "youtube_mv"
+    short_form = "short_form"
+    premiere = "premiere"
+    visualizer = "visualizer"
+
+
 @app.callback()
 def main() -> None:
     """Open A&R CLI."""
@@ -39,6 +47,23 @@ def main() -> None:
 def version_cmd() -> None:
     """Print package version."""
     console.print(__version__)
+
+
+def _print_plays_and_gaps(gaps, plays, disclaimer: str) -> None:
+    if gaps:
+        gap_table = Table(title="Gaps")
+        gap_table.add_column("Severity")
+        gap_table.add_column("Code")
+        gap_table.add_column("Message")
+        for g in gaps:
+            gap_table.add_row(g.severity, g.code, g.message)
+        console.print(gap_table)
+
+    for play in plays:
+        tag = "PRIMARY" if play.primary else "ALT"
+        console.print(Panel("\n".join(f"• {a}" for a in play.actions), title=f"{tag}: {play.title}"))
+
+    console.print(f"[dim]{disclaimer}[/dim]")
 
 
 @app.command("analyze")
@@ -88,20 +113,64 @@ def analyze(
         comp_table.add_row(m.comp.title, m.comp.artist, f"{m.distance:.3f}", ", ".join(m.why))
     console.print(comp_table)
 
-    if brief.gaps:
-        gap_table = Table(title="Gaps")
-        gap_table.add_column("Severity")
-        gap_table.add_column("Code")
-        gap_table.add_column("Message")
-        for g in brief.gaps:
-            gap_table.add_row(g.severity, g.code, g.message)
-        console.print(gap_table)
+    _print_plays_and_gaps(brief.gaps, brief.plays, brief.disclaimer)
 
-    for play in brief.plays:
-        tag = "PRIMARY" if play.primary else "ALT"
-        console.print(Panel("\n".join(f"• {a}" for a in play.actions), title=f"{tag}: {play.title}"))
 
-    console.print(f"[dim]{brief.disclaimer}[/dim]")
+@app.command("analyze-video")
+def analyze_video(
+    video: Path = typer.Argument(..., exists=True, readable=True, help="Path to music video file"),
+    goal: VideoGoalOption = typer.Option(
+        VideoGoalOption.youtube_mv,
+        "--goal",
+        "-g",
+        help="Video strategy goal",
+    ),
+    comps: Optional[Path] = typer.Option(None, "--comps", help="Optional audio comps JSON"),
+    json_out: Optional[Path] = typer.Option(None, "--json", help="Write full brief JSON to path"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print primary play title"),
+) -> None:
+    """Watch a music video (picture + audio) and print a distribution strategy brief."""
+    brief = build_video_brief(video, goal=VideoGoal(goal.value), comps_path=comps)
+
+    if json_out:
+        json_out.write_text(json.dumps(brief.to_pretty_dict(), indent=2), encoding="utf-8")
+        console.print(f"[dim]Wrote {json_out}[/dim]")
+
+    if quiet:
+        primary = next((p for p in brief.plays if p.primary), brief.plays[0] if brief.plays else None)
+        console.print(primary.title if primary else "No play generated")
+        return
+
+    v = brief.video
+    console.print(
+        Panel.fit(
+            f"[bold]{video.name}[/bold]\n"
+            f"Goal: {brief.goal.value} · Fit: {brief.fit.score:.2f}\n"
+            f"{v.width}x{v.height} {v.aspect} · {v.duration_sec/60:.2f} min · "
+            f"{v.scene_cut_count} cuts ({v.cuts_per_minute:.1f}/min)\n"
+            f"open3={v.opening_3s_energy:.2f} open15={v.opening_15s_energy:.2f} · "
+            f"hook↔picture sync={v.audio_hook_visual_sync:.2f}\n"
+            f"audio {brief.audio.tempo_bpm:.0f} BPM · hook ~{brief.audio.hook_onset_sec:.0f}s",
+            title="Open A&R · Music Video",
+        )
+    )
+
+    fit_table = Table(title="Video fit rationale")
+    fit_table.add_column("Signal")
+    for line in brief.fit.rationale:
+        fit_table.add_row(line)
+    console.print(fit_table)
+
+    clip_table = Table(title="Suggested clip windows")
+    clip_table.add_column("Label")
+    clip_table.add_column("Start", justify="right")
+    clip_table.add_column("End", justify="right")
+    clip_table.add_column("Why")
+    for w in brief.clip_windows:
+        clip_table.add_row(w["label"], f"{w['start_sec']:.1f}s", f"{w['end_sec']:.1f}s", w["why"])
+    console.print(clip_table)
+
+    _print_plays_and_gaps(brief.gaps, brief.plays, brief.disclaimer)
 
 
 if __name__ == "__main__":

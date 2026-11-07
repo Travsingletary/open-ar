@@ -9,14 +9,23 @@ It answers: **given a goal, what should you do with this track — and why**, us
 
 ```bash
 open-ar analyze your-song.wav --goal playlist
+open-ar analyze-video your-video.mp4 --goal youtube_mv
 ```
 
-Output:
+**Audio brief**
 - Sonic snapshot (BPM, energy, hook timing proxy, key/mode estimate)
 - Nearest **comps** from a seed catalog (bring your own)
 - **Fit score** for a goal (`playlist`, `club`, `sync`, `cult`, `lead_single`)
-- **Gaps** (late hook, long runtime, low club energy, …)
-- **Plays** — one primary strategy + alternates
+- **Gaps** / **Plays** — strategy with evidence
+
+**Music-video brief** (`analyze-video`)
+- Watches the file via ffmpeg: aspect, scene cuts, opening energy, peak picture moment
+- Pulls the audio bed and scores hook↔picture sync
+- Goals: `youtube_mv`, `short_form`, `premiere`, `visualizer`
+- Suggests 15s/30s/60s clip windows + thumbnail still timestamp
+- Playbook: re-edit, Shorts pack, premiere event, or visualizer SEO path
+
+Requires **ffmpeg** / **ffprobe** on your PATH.
 
 ## Install
 
@@ -39,6 +48,11 @@ open-ar analyze path/to/track.wav --goal sync --json brief.json
 
 # Quiet: only the primary play title
 open-ar analyze path/to/track.wav -g lead_single -q
+
+# Watch a music video and strategize distribution
+open-ar analyze-video path/to/video.mp4 --goal youtube_mv
+open-ar analyze-video path/to/video.mp4 -g short_form --json mv-brief.json
+open-ar analyze-video path/to/video.mp4 -g premiere -q
 ```
 
 ### Bring your own comps
@@ -74,8 +88,10 @@ pytest
 
 ## Roadmap (intentional)
 
+- [x] Music-video watch path (ffmpeg scene/luma + audio sync strategy)
+- [ ] YouTube/TikTok URL ingest (download → analyze) when you supply rights-safe tooling
+- [ ] Face / lyric / text-on-screen detectors for richer picture briefs
 - [ ] Structure sections (verse/chorus) via better segmentation
-- [ ] Optional DSP metadata enrichment (when you already have rights/IDs)
 - [ ] Thin web UI on top of the JSON brief
 - [ ] Artist-tier priors (emerging vs established changes the playbook)
 
