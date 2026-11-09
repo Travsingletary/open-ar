@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import threading
@@ -158,7 +157,7 @@ def test_share_posts_once_and_only_200_is_delivered():
     assert calls
     assert len(calls) == calls[0][2]["parts"]
     assert [item[2]["part"] for item in calls] == list(range(1, len(calls) + 1))
-    rebuilt = b"".join(base64.b64decode(item[2]["body_b64"]) for item in calls)
+    rebuilt = "".join(item[2]["text"] for item in calls).encode("utf-8")
     assert rebuilt == posted_bytes(handoff)
     document = json.loads(rebuilt)
     assert calls[0][0] == "https://hooks.example.test/routine"
@@ -538,9 +537,10 @@ def test_single_part_envelope_stays_under_a_wide_cap():
     wire = posted_bytes(parts[0])
     assert len(wire) <= 20_000
     assert list(json.loads(wire))[-1] == "zz_end"
-    assert base64.b64decode(parts[0]["body_b64"]) == posted_bytes(handoff)
-    assert parts[0]["canonical_sha256"] == handoff["payload_sha256"]
-    assert parts[0]["canonical_utf8_bytes"] == handoff["payload_utf8_bytes"]
+    assert parts[0]["text"].encode("utf-8") == posted_bytes(handoff)
+    assert parts[0]["part_hash_of"] == "utf8 bytes of text"
+    assert parts[0]["payload_sha256"] == handoff["payload_sha256"]
+    assert parts[0]["payload_utf8_bytes"] == handoff["payload_utf8_bytes"]
 
 
 def test_part_over_cap_posts_nothing():
@@ -563,32 +563,84 @@ def test_part_over_cap_posts_nothing():
     assert "Not sent" in result["detail"]
 
 
+def _escape_spans(text: str) -> list[tuple[int, int]]:
+    spans = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            index += 1
+            continue
+        if (
+            index + 6 <= len(text)
+            and text[index + 1] == "u"
+            and all(char in "0123456789abcdefABCDEF" for char in text[index + 2 : index + 6])
+        ):
+            end = index + 6
+        else:
+            end = min(index + 2, len(text))
+        spans.append((index, end))
+        index = end
+    return spans
+
+
 def test_large_single_track_brief_splits_without_dropping_evidence():
     """A sealed single-track brief of about 8.8 KB is delivered in full, in parts."""
-    handoff = build_handoff([_brief("/Users/user/Projects/open-ar-test/test-track.wav")])
+    brief = _brief("/Users/user/Projects/open-ar-test/test-track.wav")
+    brief = brief.model_copy(
+        update={
+            "plays": [
+                Play(
+                    primary=True,
+                    title='Quote "here" — then hold',
+                    actions=["Keep the backslash \\ in this note"],
+                    evidence=["No verified hook. An onset peak is not a cut."],
+                )
+            ]
+        }
+    )
+    handoff = build_handoff([brief])
     document = posted_bytes(handoff)
-    assert 8600 <= len(document) <= 9800
+    document_text = document.decode("utf-8")
+    assert 8600 <= len(document) <= 11000
+    assert "—" in document_text
+    assert "\\u" not in document_text or "\\" in document_text
     parts, problem = plan_parts(handoff, DEFAULT_PART_BYTES)
     assert problem is None
     assert len(parts) > 1
-    decoded = b""
+    assert "body_b64" not in json.dumps(parts)
+    decoded = ""
+    cursor = 0
+    spans = _escape_spans(document_text)
     for index, part in enumerate(parts, start=1):
         wire = posted_bytes(part)
         parsed = json.loads(wire)
         assert len(wire) <= DEFAULT_PART_BYTES
+        assert len(wire) <= 3000
         assert list(parsed)[-1] == "zz_end"
         assert parsed["zz_end"] == "complete"
         assert parsed["part"] == index
         assert parsed["parts"] == len(parts)
+        assert parsed["part_hash_of"] == "utf8 bytes of text"
         assert parsed["correlation_id"] == handoff["correlation_id"]
-        assert parsed["canonical_sha256"] == handoff["payload_sha256"]
-        assert parsed["canonical_utf8_bytes"] == handoff["payload_utf8_bytes"]
+        assert parsed["payload_sha256"] == handoff["payload_sha256"]
+        assert parsed["payload_utf8_bytes"] == handoff["payload_utf8_bytes"]
         assert parsed["document_utf8_bytes"] == len(document)
-        raw_slice = base64.b64decode(parsed["body_b64"])
-        assert hashlib.sha256(raw_slice).hexdigest() == parsed["part_sha256"]
-        decoded += raw_slice
-    assert decoded == document
-    rebuilt = json.loads(decoded)
+        text = parsed["text"]
+        raw = text.encode("utf-8")
+        assert hashlib.sha256(raw).hexdigest() == parsed["part_sha256"]
+        assert parsed["part_utf8_bytes"] == len(raw)
+        assert parsed["text_head"] == text[:24]
+        assert parsed["text_tail"] == text[-24:]
+        end = cursor + len(text)
+        for start, stop in spans:
+            assert not (start < end < stop)
+        if index < len(parts):
+            assert text.endswith((",", "}"))
+        decoded += text
+        cursor = end
+    assert decoded.encode("utf-8") == document
+    assert b"".join(part["text"].encode("utf-8") for part in parts) == document
+    rebuilt = json.loads(decoded.encode("utf-8"))
     measurements = rebuilt["tracks"][0]["measurements"]
     assert measurements["integrated_lufs"]["unit"] == "LUFS"
     assert measurements["rms_rel_peak_db"]["unit"] == "dB re peak RMS"
