@@ -12,7 +12,7 @@ from rich.table import Table
 
 from open_ar import __version__
 from open_ar.acousticbrainz import add_to_catalog
-from open_ar.andre import build_handoff, inspect_connection, share_with_andre
+from open_ar.andre import build_handoff, inspect_connection, posted_bytes, share_with_andre
 from open_ar.brief import build_brief
 from open_ar.comps import similarity_problem
 from open_ar.edits import read_beat_times
@@ -329,6 +329,7 @@ def andre_share(
         _write_json(json_out, result)
     state = result["connection"]["state"]
     handoff_body = result["handoff"]
+    posted_len = len(posted_bytes(handoff_body))
     marketing_status = (handoff_body.get("marketing_notes") or {}).get("status", "unavailable")
     marketing_source = (handoff_body.get("marketing_notes") or {}).get("source") or "none"
     popular_status = (handoff_body.get("currently_popular") or {}).get("status", "unavailable")
@@ -341,7 +342,19 @@ def andre_share(
     console.print(
         Panel.fit(
             f"state: {state}\n"
-            f"attempted: {result['attempted']}\n"
+            f"correlation_id: {handoff_body.get('correlation_id')}\n"
+            f"contract: {handoff_body.get('contract')}\n"
+            f"zz_end: {handoff_body.get('zz_end')}\n"
+            f"canonical_utf8_bytes: {handoff_body.get('payload_utf8_bytes')}\n"
+            f"canonical_sha256: {handoff_body.get('payload_sha256')}\n"
+            f"posted_utf8_bytes: {posted_len}\n"
+            f"parts: {len(result.get('parts') or [])}\n"
+            + "".join(
+                f"part {part['part']}/{part['parts']}: {part['posted_utf8_bytes']} bytes "
+                f"envelope_sha256 {part['envelope_sha256']}\n"
+                for part in (result.get("parts") or [])
+            )
+            + f"attempted: {result['attempted']}\n"
             f"delivered: {result['delivered']}\n"
             f"sounds similar: {similar_status}\n"
             f"currently popular: {popular_status}\n"

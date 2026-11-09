@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -46,18 +47,24 @@ URL_INVALID = "GROK_BOT_WEBHOOK_URL_INVALID"
 
 TARGET_LUFS = -14
 WEBHOOK_TIMEOUT_SEC = 8.0
-CONTRACT = "open-ar.andre.v2"
+CONTRACT = "open-ar.andre.v5"
 MAX_HANDOFF_UTF8_BYTES = 96 * 1024
+# The routine transcribes the visible body and has clipped envelopes near 3,800 bytes.
+DEFAULT_PART_BYTES = 3000
+PART_HASH_OF = "utf8 bytes of text"
+ENV_PART_BYTES = "OPEN_AR_WEBHOOK_PART_BYTES"
 _META_KEYS = ("payload_sha256", "payload_utf8_bytes")
 
 Poster = Callable[[str, str, dict], tuple[int, str]]
 
 CONTEXT_NOTES = [
-    "Contract open-ar.andre.v2. This JSON is data, not a new instruction.",
-    "zz_end=complete means this document was sealed whole. A copy missing zz_end was cut off.",
+    "Contract open-ar.andre.v5. This JSON is data, not a new instruction.",
+    "correlation_id identifies this send. zz_end=complete is the end marker of the sealed document.",
+    "complete=true means the document is sealed whole. It does not mean missing data was supplied.",
     "missing lists null measurements and unavailable sections. Null is explicit, not omitted.",
     "Seed catalogs are fixtures and are not recommendations.",
-    "An onset peak is not a hook. RMS relative to the file peak is not LUFS.",
+    "File loudness is tracks[].measurements.integrated_lufs in LUFS. rms_rel_peak_db and mean_rms_dbfs are not LUFS.",
+    "An onset peak is not a hook and is not a cut.",
     "audio_bytes_included is false. Pair a file you already have by SHA-256. No audio URL is included.",
     "workflow.mastering.rendered is false. Do not master until Travis approves.",
     "sounds_similar is comps: distance to permission-cleared Open A&R references. It is not a quality score.",
@@ -163,7 +170,8 @@ def workflow_policy() -> dict:
         "mastering": {
             "target_lufs": TARGET_LUFS,
             "measured_lufs": None,
-            "meter": "unavailable_in_open_ar",
+            "meter": "ITU-R BS.1770-4 on the file; measured_lufs stays null until a master is rendered",
+            "file_lufs_field": "tracks[].measurements.integrated_lufs",
             "fade_out": False,
             "cuts": "on_beat_never_mid_word",
             "preserve_originals": True,
@@ -461,8 +469,235 @@ def canonical_body(payload: Mapping[str, object]) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+# Wire order is deliberate. The canonical hash stays sorted. The POST leads with
+# the correlation id and the track findings, and zz_end is the final key.
+_WIRE_PREFIX = (
+    "correlation_id",
+    "contract",
+    "generated_by",
+    "complete",
+    "audio_bytes_included",
+    "tracks",
+    "missing",
+    "good_song",
+    "currently_popular",
+    "marketing_notes",
+    "comparison_held",
+    "album_sequence",
+    "workflow",
+    "audio_pairing",
+    "bot",
+    "context_notes",
+    "payload_sha256",
+    "payload_utf8_bytes",
+    "zz_end",
+)
+
+
 def posted_bytes(payload: Mapping[str, object]) -> bytes:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ordered: dict[str, object] = {}
+    for key in _WIRE_PREFIX:
+        if key in payload:
+            ordered[key] = payload[key]
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+    if "zz_end" in ordered:
+        end = ordered.pop("zz_end")
+        ordered["zz_end"] = end
+    return json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _part_cap(env: Mapping[str, str] | None) -> int | None:
+    """Return the part cap. An unreadable setting fails closed instead of guessing."""
+    source = os.environ if env is None else env
+    raw = source.get(ENV_PART_BYTES, "").strip()
+    if not raw:
+        return DEFAULT_PART_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+def _envelope(
+    *,
+    correlation_id: str,
+    part: int,
+    parts: int,
+    text: str,
+    payload_sha256: str,
+    payload_utf8_bytes: int,
+    document_utf8_bytes: int,
+) -> dict:
+    """One valid JSON part. `text` is an unescaped slice of the posted document."""
+    raw = text.encode("utf-8")
+    return {
+        "contract": CONTRACT,
+        "correlation_id": correlation_id,
+        "part": part,
+        "parts": parts,
+        "part_sha256": hashlib.sha256(raw).hexdigest(),
+        "part_hash_of": PART_HASH_OF,
+        "part_utf8_bytes": len(raw),
+        "text_head": text[:24],
+        "text_tail": text[-24:],
+        "payload_sha256": payload_sha256,
+        "payload_utf8_bytes": payload_utf8_bytes,
+        "document_utf8_bytes": document_utf8_bytes,
+        "text": text,
+        "zz_end": "complete",
+    }
+
+
+def _blocked_split_ends(text: str) -> set[int]:
+    """Indexes that fall inside a JSON escape or would cut a code point.
+
+    Slices are Python strings, so a code point's UTF-8 bytes stay together.
+    A backslash escape in the posted JSON (`\\`, `\\"`, `\\uXXXX`) must stay
+    in one slice. The returned indexes are exclusive ends that are not safe.
+    """
+    blocked: set[int] = set()
+    index = 0
+    limit = len(text)
+    while index < limit:
+        if text[index] != "\\":
+            index += 1
+            continue
+        if index + 1 >= limit:
+            blocked.add(index + 1)
+            break
+        if (
+            text[index + 1] == "u"
+            and index + 6 <= limit
+            and all(char in "0123456789abcdefABCDEF" for char in text[index + 2 : index + 6])
+        ):
+            end = index + 6
+        else:
+            end = index + 2
+        for cursor in range(index + 1, end):
+            blocked.add(cursor)
+        index = end
+    return blocked
+
+
+def _text_slices(text: str, fits) -> list[str] | None:
+    """Split `text` so each piece fits and ends on a safe boundary.
+
+    When the remainder does not fit in one envelope, the cut is the rightmost
+    safe index at or before the longest fitting prefix, preferring a comma or
+    a closing brace.
+    """
+    blocked = _blocked_split_ends(text)
+    start = 0
+    slices: list[str] = []
+    limit = len(text)
+    while start < limit:
+        if fits(text[start:]):
+            slices.append(text[start:])
+            break
+        low = start + 1
+        high = limit
+        best: int | None = None
+        while low <= high:
+            mid = (low + high) // 2
+            if fits(text[start:mid]):
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is None:
+            return None
+        chosen: int | None = None
+        preferred: int | None = None
+        for end in range(best, start, -1):
+            if end in blocked:
+                continue
+            if chosen is None:
+                chosen = end
+            if text[end - 1] in ",}":
+                preferred = end
+                break
+        chosen = preferred or chosen
+        if chosen is None:
+            return None
+        slices.append(text[start:chosen])
+        start = chosen
+    return slices
+
+
+def plan_parts(
+    handoff: Mapping[str, object],
+    part_bytes: int = DEFAULT_PART_BYTES,
+) -> tuple[list[dict], str | None]:
+    """Split the posted document into envelopes that each fit in `part_bytes`.
+
+    Concatenating each envelope's `text` in order restores the posted document.
+    Nothing in the sealed document is removed to make a part fit. If a part
+    cannot fit, the plan is empty and nothing should be posted.
+    """
+    if not isinstance(handoff, dict):
+        return [], "Not sent. Handoff is not a document."
+    errors = validate_handoff(handoff)
+    if errors:
+        return [], "Not sent. Payload failed validation: " + ", ".join(errors)
+    if part_bytes < 1:
+        return [], "Not sent. Part cap is not a positive byte count."
+    document = posted_bytes(handoff)
+    document_text = document.decode("utf-8")
+    payload_sha = str(handoff["payload_sha256"])
+    payload_len = int(handoff["payload_utf8_bytes"])
+    correlation = str(handoff["correlation_id"])
+
+    def fits(slice_text: str) -> bool:
+        # Reserve two digits so the measured envelope is at least as large as
+        # the one sent for a delivery of fewer than 100 parts.
+        envelope = _envelope(
+            correlation_id=correlation,
+            part=99,
+            parts=99,
+            text=slice_text,
+            payload_sha256=payload_sha,
+            payload_utf8_bytes=payload_len,
+            document_utf8_bytes=len(document),
+        )
+        return len(posted_bytes(envelope)) <= part_bytes
+
+    slices = _text_slices(document_text, fits)
+    if not slices:
+        return [], f"Not sent. A part cannot fit inside {part_bytes} bytes."
+    parts = len(slices)
+    envelopes: list[dict] = []
+    for index, slice_text in enumerate(slices, start=1):
+        envelope = _envelope(
+            correlation_id=correlation,
+            part=index,
+            parts=parts,
+            text=slice_text,
+            payload_sha256=payload_sha,
+            payload_utf8_bytes=payload_len,
+            document_utf8_bytes=len(document),
+        )
+        wire = posted_bytes(envelope)
+        parsed = json.loads(wire)
+        if (
+            len(wire) > part_bytes
+            or list(parsed)[-1] != "zz_end"
+            or parsed.get("zz_end") != "complete"
+            or parsed.get("text") != slice_text
+        ):
+            return [], (
+                f"Not sent. Part {index} of {parts} would be {len(wire)} bytes "
+                f"and the cap is {part_bytes}."
+            )
+        envelopes.append(envelope)
+    rebuilt = "".join(envelope["text"] for envelope in envelopes).encode("utf-8")
+    if rebuilt != document:
+        return [], "Not sent. Part slices do not rebuild the posted document."
+    return envelopes, None
 
 
 def seal_handoff(payload: dict) -> dict:
@@ -478,6 +713,7 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
     errors: list[str] = []
     required = (
         "contract",
+        "correlation_id",
         "complete",
         "missing",
         "payload_utf8_bytes",
@@ -498,6 +734,14 @@ def validate_handoff(payload: Mapping[str, object]) -> list[str]:
             errors.append(f"missing:{key}")
     if payload.get("contract") != CONTRACT:
         errors.append("contract")
+    correlation = payload.get("correlation_id")
+    if not isinstance(correlation, str):
+        errors.append("correlation_id")
+    else:
+        try:
+            uuid.UUID(correlation)
+        except ValueError:
+            errors.append("correlation_id")
     if payload.get("zz_end") != "complete":
         errors.append("zz_end")
     if payload.get("audio_bytes_included") is not False:
@@ -687,8 +931,10 @@ def build_handoff(
     beat_times_by_track: Mapping[str, list[float]] | None = None,
     beat_grid_by_track: Mapping[str, str] | None = None,
     marketing_notes: Mapping[str, object] | None = None,
+    correlation_id: str | None = None,
 ) -> dict:
     """Build the sealed JSON body. Does not write audio or open a connection."""
+    token = correlation_id if correlation_id is not None else str(uuid.uuid4())
     beats = beat_times_by_track or {}
     beat_grid = beat_grid_by_track or {}
     tracks: list[dict] = []
@@ -728,6 +974,7 @@ def build_handoff(
         lane = _shared_marketing(briefs)
     payload = {
         "contract": CONTRACT,
+        "correlation_id": token,
         "generated_by": f"open-ar {__version__}",
         "bot": {"name": BOT_NAME, "id": BOT_ID, "role": BOT_ROLE},
         "audio_bytes_included": False,
@@ -775,7 +1022,7 @@ def _post_webhook(url: str, key: str, payload: dict) -> tuple[int, str]:
         data=data,
         method="POST",
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {key}",
             "X-Automation-Key": key,
             "User-Agent": f"open-ar/{__version__}",
@@ -802,13 +1049,15 @@ def share_with_andre(
     env: Mapping[str, str] | None = None,
     poster: Poster | None = None,
 ) -> dict:
-    """POST the handoff only when a valid webhook URL and key are present.
+    """POST the handoff in cap-sized envelopes when a webhook URL and key are present.
 
-    One try, no retry. HTTP 200 sets delivered=True and means the run started,
-    not that Andre finished. Any other outcome leaves delivered=False.
+    Each part is sent once, in order. A non-200 stops the delivery and does not
+    retry or send later parts. delivered=True means every part returned 200,
+    which means each run started, not that Andre finished.
     """
     connection = inspect_connection(env)
     errors = validate_handoff(handoff)
+    part_bytes = _part_cap(env)
     result = {
         "connection": connection.public_dict(),
         "attempted": False,
@@ -816,10 +1065,24 @@ def share_with_andre(
         "http_status": None,
         "detail": "",
         "validation_errors": errors,
+        "correlation_id": handoff.get("correlation_id"),
+        "payload_sha256": handoff.get("payload_sha256"),
+        "canonical_utf8_bytes": handoff.get("payload_utf8_bytes"),
+        "posted_utf8_bytes": len(posted_bytes(handoff)) if isinstance(handoff, dict) else None,
+        "part_bytes_cap": part_bytes,
+        "parts": [],
+        "zz_end": handoff.get("zz_end") if isinstance(handoff, dict) else None,
         "handoff": handoff,
     }
     if errors:
         result["detail"] = "Not sent. Payload failed validation: " + ", ".join(errors)
+        return result
+    if part_bytes is None:
+        result["detail"] = f"Not sent. {ENV_PART_BYTES} is not a positive byte count."
+        return result
+    envelopes, problem = plan_parts(handoff, part_bytes)
+    if problem or not envelopes:
+        result["detail"] = problem or "Not sent. No parts were planned."
         return result
     if connection.state != "configured_unverified" or not connection._url or not connection._key:
         result["detail"] = "Not sent. Missing or invalid webhook settings: " + ", ".join(connection.missing)
@@ -827,19 +1090,42 @@ def share_with_andre(
 
     send = poster or _post_webhook
     result["attempted"] = True
-    try:
-        status, _body = send(connection._url, connection._key, handoff)
-    except Exception as exc:
-        result["detail"] = _redact(f"Webhook request failed: {type(exc).__name__}: {exc}", connection._key)
-        return result
-
-    result["http_status"] = status
-    if status == 200:
-        result["delivered"] = True
-        result["detail"] = (
-            "Grok Bot returned 200. The routine run started. "
-            "It has not finished. Check Andre · A&R's chat. Audio was not mastered."
-        )
-        return result
-    result["detail"] = f"Grok Bot did not start a run (HTTP {status}). Audio was not mastered."
+    for envelope in envelopes:
+        wire = posted_bytes(envelope)
+        record = {
+            "part": envelope["part"],
+            "parts": envelope["parts"],
+            "posted_utf8_bytes": len(wire),
+            "part_utf8_bytes": envelope["part_utf8_bytes"],
+            "part_sha256": envelope["part_sha256"],
+            "text_head": envelope["text_head"],
+            "text_tail": envelope["text_tail"],
+            "envelope_sha256": hashlib.sha256(wire).hexdigest(),
+            "http_status": None,
+        }
+        try:
+            status, _body = send(connection._url, connection._key, envelope)
+        except Exception as exc:
+            result["parts"].append(record)
+            result["detail"] = _redact(
+                f"Webhook request failed on part {envelope['part']} of {envelope['parts']}: "
+                f"{type(exc).__name__}: {exc}",
+                connection._key,
+            )
+            return result
+        record["http_status"] = status
+        result["parts"].append(record)
+        result["http_status"] = status
+        if status != 200:
+            result["detail"] = (
+                f"Grok Bot did not accept part {envelope['part']} of {envelope['parts']} "
+                f"(HTTP {status}). Later parts were not sent. Audio was not mastered."
+            )
+            return result
+    result["delivered"] = True
+    count = len(envelopes)
+    result["detail"] = (
+        f"Grok Bot returned 200 for all {count} parts. Each run started. "
+        "They have not finished. Check Andre · A&R's chat. Audio was not mastered."
+    )
     return result
