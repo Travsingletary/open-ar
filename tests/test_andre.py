@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import threading
@@ -10,13 +11,16 @@ from typer.testing import CliRunner
 from open_ar.andre import (
     BOT_ID,
     CONTRACT,
+    DEFAULT_PART_BYTES,
     ENV_KEY,
+    ENV_PART_BYTES,
     ENV_URL,
     MAX_HANDOFF_UTF8_BYTES,
     URL_HAS_CREDENTIALS,
     URL_NOT_HTTPS,
     build_handoff,
     inspect_connection,
+    plan_parts,
     posted_bytes,
     share_with_andre,
     validate_handoff,
@@ -151,22 +155,35 @@ def test_share_posts_once_and_only_200_is_delivered():
     result = share_with_andre(handoff, env=env, poster=poster)
     assert result["delivered"] is True
     assert result["http_status"] == 200
-    assert len(calls) == 1
+    assert calls
+    assert len(calls) == calls[0][2]["parts"]
+    assert [item[2]["part"] for item in calls] == list(range(1, len(calls) + 1))
+    rebuilt = b"".join(base64.b64decode(item[2]["body_b64"]) for item in calls)
+    assert rebuilt == posted_bytes(handoff)
+    document = json.loads(rebuilt)
     assert calls[0][0] == "https://hooks.example.test/routine"
     assert calls[0][2]["contract"] == CONTRACT
     assert calls[0][2]["zz_end"] == "complete"
-    assert "album_sequence" in calls[0][2]
-    assert "trims" in calls[0][2]["tracks"][0]
+    assert "album_sequence" in document
+    assert "trims" in document["tracks"][0]
     assert BOT_ID not in calls[0][0]
     assert "super-secret-key" not in json.dumps(result)
-    assert "has not finished" in result["detail"]
+    assert "not finished" in result["detail"]
+    for item in calls:
+        wire = posted_bytes(item[2])
+        assert len(wire) <= DEFAULT_PART_BYTES
+        assert list(json.loads(wire))[-1] == "zz_end"
+
+    created_calls = []
 
     def poster_created(url, key, body):
+        created_calls.append(body)
         return 201, "created"
 
     created = share_with_andre(handoff, env=env, poster=poster_created)
     assert created["delivered"] is False
     assert created["http_status"] == 201
+    assert len(created_calls) == 1
 
 
 def test_trim_proposals_stay_on_beats_and_refuse_without_one():
@@ -511,6 +528,76 @@ def test_one_track_fits_and_eight_are_refused_without_dropping_sections():
         assert result["delivered"] is False
     else:
         assert errors == []
+
+
+def test_single_part_envelope_stays_under_a_wide_cap():
+    handoff = build_handoff([_brief("/tmp/open-ar-one-part.wav")])
+    parts, problem = plan_parts(handoff, part_bytes=20_000)
+    assert problem is None
+    assert len(parts) == 1
+    wire = posted_bytes(parts[0])
+    assert len(wire) <= 20_000
+    assert list(json.loads(wire))[-1] == "zz_end"
+    assert base64.b64decode(parts[0]["body_b64"]) == posted_bytes(handoff)
+    assert parts[0]["canonical_sha256"] == handoff["payload_sha256"]
+    assert parts[0]["canonical_utf8_bytes"] == handoff["payload_utf8_bytes"]
+
+
+def test_part_over_cap_posts_nothing():
+    handoff = build_handoff([_brief("/tmp/missing-open-ar-track.wav")])
+    env = {
+        ENV_URL: "https://hooks.example.test/routine",
+        ENV_KEY: "k",
+        ENV_PART_BYTES: "200",
+    }
+    calls = []
+
+    def poster(url, key, body):
+        calls.append(body)
+        return 200, "ok"
+
+    result = share_with_andre(handoff, env=env, poster=poster)
+    assert calls == []
+    assert result["attempted"] is False
+    assert result["delivered"] is False
+    assert "Not sent" in result["detail"]
+
+
+def test_large_single_track_brief_splits_without_dropping_evidence():
+    """A sealed single-track brief of about 8.8 KB is delivered in full, in parts."""
+    handoff = build_handoff([_brief("/Users/user/Projects/open-ar-test/test-track.wav")])
+    document = posted_bytes(handoff)
+    assert 8600 <= len(document) <= 9800
+    parts, problem = plan_parts(handoff, DEFAULT_PART_BYTES)
+    assert problem is None
+    assert len(parts) > 1
+    decoded = b""
+    for index, part in enumerate(parts, start=1):
+        wire = posted_bytes(part)
+        parsed = json.loads(wire)
+        assert len(wire) <= DEFAULT_PART_BYTES
+        assert list(parsed)[-1] == "zz_end"
+        assert parsed["zz_end"] == "complete"
+        assert parsed["part"] == index
+        assert parsed["parts"] == len(parts)
+        assert parsed["correlation_id"] == handoff["correlation_id"]
+        assert parsed["canonical_sha256"] == handoff["payload_sha256"]
+        assert parsed["canonical_utf8_bytes"] == handoff["payload_utf8_bytes"]
+        assert parsed["document_utf8_bytes"] == len(document)
+        raw_slice = base64.b64decode(parsed["body_b64"])
+        assert hashlib.sha256(raw_slice).hexdigest() == parsed["part_sha256"]
+        decoded += raw_slice
+    assert decoded == document
+    rebuilt = json.loads(decoded)
+    measurements = rebuilt["tracks"][0]["measurements"]
+    assert measurements["integrated_lufs"]["unit"] == "LUFS"
+    assert measurements["rms_rel_peak_db"]["unit"] == "dB re peak RMS"
+    assert measurements["duration_sec"]["unit"] == "s"
+    assert rebuilt["missing"]
+    assert all(item.get("reason") for item in rebuilt["missing"])
+    assert rebuilt["complete"] is True
+    assert rebuilt["zz_end"] == "complete"
+    assert rebuilt["payload_sha256"] == handoff["payload_sha256"]
 
 
 def test_bad_correlation_id_is_not_posted():

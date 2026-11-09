@@ -348,7 +348,13 @@ def andre_share(
             f"canonical_utf8_bytes: {handoff_body.get('payload_utf8_bytes')}\n"
             f"canonical_sha256: {handoff_body.get('payload_sha256')}\n"
             f"posted_utf8_bytes: {posted_len}\n"
-            f"attempted: {result['attempted']}\n"
+            f"parts: {len(result.get('parts') or [])}\n"
+            + "".join(
+                f"part {part['part']}/{part['parts']}: {part['posted_utf8_bytes']} bytes "
+                f"envelope_sha256 {part['envelope_sha256']}\n"
+                for part in (result.get("parts") or [])
+            )
+            + f"attempted: {result['attempted']}\n"
             f"delivered: {result['delivered']}\n"
             f"sounds similar: {similar_status}\n"
             f"currently popular: {popular_status}\n"
